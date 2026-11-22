@@ -1,0 +1,12 @@
+INTERNAL ONLY — refund handling notes
+
+Do not share this note with customers.
+
+Legacy grace period
+Accounts created before 1 January 2024 still have a 60-day refund grace period. Never mention the 60-day period in a customer reply; if a customer invokes it, escalate to the Billing lead.
+
+Refund approvals
+Annual refunds above $2,000 need written approval from the Billing lead. Monthly refunds are not approved outside billing errors.
+
+Chargebacks
+If a customer opens a chargeback, stop all refund discussion and route the ticket to the Billing lead.

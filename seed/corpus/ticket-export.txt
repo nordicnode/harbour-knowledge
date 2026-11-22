@@ -1,0 +1,18 @@
+Ticket export — #4821, #4830, #4899 (March 2025)
+
+Ticket #4821
+Customer: I was charged twice for February.
+Agent: Duplicate charges are refunded in full. I have raised the refund.
+> On 2 Mar 2025, Billing wrote:
+> Please check invoice INV-2091.
+-----Original Message-----
+From: customer@example.com
+This is a duplicate of the February invoice.
+
+Ticket #4830
+Customer: Can we pay by invoice?
+Agent: Annual Enterprise contracts can be paid by invoice. Team and Business are card only.
+
+Ticket #4899
+Customer: SSO setup is failing in Okta.
+Agent: SSO is Enterprise only. I sent the Okta guide.
