@@ -589,6 +589,13 @@ async def run_ingest(
     stage = "parse"
     async with tenant_conn(tenant_id) as conn:
         try:
+            # Serialize ingestion with deletion for this source. The lock lives
+            # for the transaction, so a delete waits for an in-flight read
+            # instead of racing the finish update or deadlocking on job rows.
+            await conn.execute(
+                "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (str(source_id),),
+            )
             # Claim the job atomically so two workers cannot process it twice.
             claimed = await fetch_one(
                 conn,
@@ -661,10 +668,21 @@ async def run_ingest(
                 await propose_draft(conn, tenant_id, source, document, passages, user_id)
 
             stage = "finish"
-            await conn.execute(
-                "update sources set status = 'active', ingested_at = now(), updated_at = now() where id = %s",
+            # A source can be removed while a long ingest is still running. Do
+            # not let the worker resurrect it after the delete has committed.
+            finished = await fetch_one(
+                conn,
+                """update sources set status = 'active', ingested_at = now(), updated_at = now()
+                   where id = %s and deleted_at is null and status <> 'withdrawn'
+                   returning id""",
                 (source_id,),
             )
+            if finished is None:
+                await _set_job(
+                    conn, job_id, "failed", "withdrawn",
+                    "The source was removed during ingestion.",
+                )
+                return
             stats = {
                 "sections": len(chunk_set.sections),
                 "passages": len(passages),

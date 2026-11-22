@@ -55,7 +55,7 @@ export function Topbar({ meta }: { meta: Meta | null }) {
           <Link
             href="/search"
             aria-label="Search"
-            className="flex h-8 w-8 items-center justify-center rounded-lg border border-line bg-surface text-muted md:hidden"
+            className="flex h-8 w-8 items-center justify-center rounded-lg border border-line bg-surface text-ink-2 md:hidden"
           >
             <Search size={14} />
           </Link>

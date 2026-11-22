@@ -15,6 +15,7 @@ from ..config import Settings
 from ..deps import Session
 from ..errors import AppError, validation
 from ..intelligence import EvidencePassage, get_intelligence
+from ..intelligence.dev import tokenize
 from ..ingest.pipeline import quote_in_text
 from .search import (
     RetrievedPassage,
@@ -67,6 +68,40 @@ def _iso(value) -> str | None:
     if isinstance(value, (date, datetime)):
         return value.isoformat()
     return str(value)
+
+
+def _supporting_quote(answer_md: str, passage_text: str, max_chars: int = 600) -> str | None:
+    """Pick an exact passage excerpt with the strongest overlap with the answer.
+
+    Fallback answers cite passage ids, not quote spans. Taking the first 600
+    characters makes a citation look verified even when the excerpt has nothing
+    to do with the claim. Instead, choose a sentence-like span that shares the
+    answer's terms, then verify the returned text is literally in the passage.
+    """
+    answer_terms = set(tokenize(re.sub(r"\[[0-9]+\]|\[P:[^\]]+\]", "", answer_md or "")))
+    if not answer_terms or not passage_text.strip():
+        return None
+
+    candidates: list[tuple[float, int, int]] = []
+    for match in re.finditer(r"[^.!?\n]+[.!?]?", passage_text):
+        candidate = match.group().strip()
+        if len(candidate) < 25:
+            continue
+        terms = set(tokenize(candidate))
+        if not terms:
+            continue
+        overlap = len(answer_terms & terms) / max(1, len(answer_terms))
+        candidates.append((overlap, match.start(), match.end()))
+    if not candidates:
+        return None
+
+    score, start, end = max(candidates, key=lambda item: (item[0], item[2] - item[1]))
+    if score <= 0:
+        return None
+    quote = passage_text[start : min(end, start + max_chars)].strip()
+    if len(quote) < 20 or not quote_in_text(quote, passage_text):
+        return None
+    return quote
 
 
 async def _historical_accuracy(conn: AsyncConnection, answer_id: UUID | None) -> float:
@@ -234,9 +269,11 @@ async def _canonical_payload(
     rows = await (
         await conn.execute(
             """select ae.id as evidence_id, ae.passage_id, ae.quote, ae.claim_ref,
-                      p.text, p.status as passage_status, p.section_path,
-                      d.title as document_title, d.effective_from,
-                      s.title as source_title, s.visibility
+                      p.text, p.status as passage_status, p.section_path, p.parent_id, p.page_ref,
+                      p.document_id, d.title as document_title, d.effective_from,
+                      d.version as document_version, d.doc_type,
+                      d.plan_scope, d.product_version_scope,
+                      s.id as source_id, s.title as source_title, s.source_tier, s.visibility
                from answer_evidence ae
                join passages p on p.id = ae.passage_id
                join documents d on d.id = p.document_id
@@ -271,21 +308,21 @@ async def _canonical_payload(
         evidence.append(
             RetrievedPassage(
                 passage_id=row["passage_id"],
-                parent_id=None,
+                parent_id=row["parent_id"],
                 child_text=row["text"],
                 parent_text=row["text"],
                 section_path=row["section_path"] or "Overview",
-                page_ref=None,
-                document_id=UUID(int=0),
+                page_ref=row["page_ref"],
+                document_id=row["document_id"],
                 document_title=row["document_title"],
-                document_version=answer["current_version"],
-                doc_type="policy",
+                document_version=row["document_version"],
+                doc_type=row["doc_type"],
                 effective_from=row["effective_from"],
-                plan_scope=answer["plan_scope"],
-                version_scope=answer["version_scope"],
-                source_id=UUID(int=0),
+                plan_scope=row["plan_scope"] or [],
+                version_scope=row["product_version_scope"] or [],
+                source_id=row["source_id"],
                 source_title=row["source_title"],
-                source_tier="official_doc",
+                source_tier=row["source_tier"],
                 visibility=row["visibility"],
                 rerank_score=1.0,
                 coverage=1.0,
@@ -409,6 +446,12 @@ async def _maybe_propose_fallback(
     have to re-draft an answer Harbour already grounded in cited sources.
     """
     if not evidence or not citations:
+        return
+    citations = [
+        citation for citation in citations
+        if citation.get("verified") and (citation.get("quote") or "").strip()
+    ]
+    if not citations:
         return
 
     existing = (
@@ -670,18 +713,23 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
                     answer_md = f"{label}\n\n{answer_md}"
                     if conflict_notice:
                         answer_md = f"> **Sources disagree.** {conflict_notice}\n\n{answer_md}"
-                    citations = [
-                        Citation(
-                            evidence_id=str(p.passage_id),
-                            passage_id=str(p.passage_id),
-                            quote=p.child_text[:600],
-                            source_title=p.source_title,
-                            source_date=_iso(p.effective_from),
-                            section_path=p.section_path,
-                            verified=True,
-                        ).as_dict()
-                        for p in cited_passages
-                    ]
+                    citations = []
+                    for p in cited_passages:
+                        quote = _supporting_quote(generation.answer_md, p.child_text)
+                        excerpt = quote or p.child_text[:300].strip()
+                        if not excerpt:
+                            continue
+                        citations.append(
+                            Citation(
+                                evidence_id=str(p.passage_id),
+                                passage_id=str(p.passage_id),
+                                quote=excerpt,
+                                source_title=p.source_title,
+                                source_date=_iso(p.effective_from),
+                                section_path=p.section_path,
+                                verified=bool(quote and quote_in_text(quote, p.child_text)),
+                            ).as_dict()
+                        )
                     await _maybe_propose_fallback(
                         conn, session, standalone, generation.answer_md, cited_passages, citations,
                         plan, product_version,

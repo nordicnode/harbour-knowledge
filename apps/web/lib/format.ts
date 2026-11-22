@@ -96,7 +96,7 @@ export function confidenceSentence(band: ConfidenceBand | string | null | undefi
   if (mode === "canonical") {
     return "Grounded in an approved canonical answer and verified evidence.";
   }
-  if (band === "high") return "Strong evidence, citations verified.";
+  if (band === "high") return "Strong evidence. Check the citations before sending.";
   if (band === "medium") return "Partial evidence. Check the sources before sending.";
   return "Not enough evidence to answer safely.";
 }

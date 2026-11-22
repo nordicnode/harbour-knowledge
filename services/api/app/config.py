@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     model_answer: str = ""
     model_judge: str = ""
     model_embed: str = ""
+    # OpenAI-compatible embedding APIs support this. Providers that reject it
+    # must still return EMBEDDING_DIM values, so disable only when necessary.
+    openai_embedding_dimensions: bool = True
     model_rerank: str = ""
     rerank_base_url: str = ""
     rerank_api_key: str = ""

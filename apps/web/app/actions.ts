@@ -103,14 +103,43 @@ export async function reingestSourceAction(id: string): Promise<ActionResult> {
   }
 }
 
-export async function deleteSourceAction(id: string): Promise<ActionResult> {
+export async function deleteSourceAction(
+  id: string,
+  redirectTo: string | null = "/knowledge",
+): Promise<ActionResult> {
   try {
-    await apiJson(`/v1/sources/${id}`, "DELETE");
+    // Deleting a source that is still being read waits for the per-source
+    // ingest lock, so allow more than the default request budget.
+    await apiJson(`/v1/sources/${id}`, "DELETE", undefined, 120_000);
+    revalidatePath(`/sources/${id}`);
     revalidatePath("/knowledge");
+    revalidatePath("/review");
     revalidatePath("/");
-    redirect("/knowledge");
+    revalidatePath("/", "layout");
+    if (redirectTo) redirect(redirectTo);
+    return { ok: true };
   } catch (error) {
     if ((error as { digest?: string })?.digest?.startsWith("NEXT_REDIRECT")) throw error;
+    return toError(error);
+  }
+}
+
+export async function deleteSourcesAction(
+  ids: string[],
+): Promise<ActionResult<{ deleted: number; missing: string[] }>> {
+  try {
+    const result = await apiJson<{ deleted: number; missing: string[] }>(
+      "/v1/sources/bulk-delete",
+      "POST",
+      { ids },
+      120_000,
+    );
+    revalidatePath("/knowledge");
+    revalidatePath("/review");
+    revalidatePath("/");
+    revalidatePath("/", "layout");
+    return { ok: true, data: result };
+  } catch (error) {
     return toError(error);
   }
 }

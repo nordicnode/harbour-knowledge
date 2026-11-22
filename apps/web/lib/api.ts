@@ -36,14 +36,14 @@ async function parseError(response: Response): Promise<ApiError> {
   }
 }
 
-async function request(path: string, init: RequestInit): Promise<Response> {
+async function request(path: string, init: RequestInit, timeoutMs = 45_000): Promise<Response> {
   let response: Response;
   try {
     response = await fetch(`${API_URL}${path}`, {
       ...init,
       headers: headers(init.headers),
       cache: "no-store",
-      signal: AbortSignal.timeout(45_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (error) {
     throw new ApiError(
@@ -64,12 +64,21 @@ export async function apiGet<T>(path: string): Promise<T> {
   return (await response.json()) as T;
 }
 
-export async function apiJson<T>(path: string, method: string, body?: unknown): Promise<T> {
-  const response = await request(path, {
-    method,
-    headers: body === undefined ? undefined : { "content-type": "application/json" },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
+export async function apiJson<T>(
+  path: string,
+  method: string,
+  body?: unknown,
+  timeoutMs = 45_000,
+): Promise<T> {
+  const response = await request(
+    path,
+    {
+      method,
+      headers: body === undefined ? undefined : { "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    },
+    timeoutMs,
+  );
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
 }

@@ -198,7 +198,7 @@ export function AskPanel({ initialQuestion = "" }: { initialQuestion?: string })
           <button
             type="button"
             onClick={() => setScopeOpen((value) => !value)}
-            className="inline-flex items-center gap-1.5 rounded-md border border-line bg-surface-2 px-2 py-1 text-[10px] text-muted transition-colors hover:border-line-strong hover:text-ink"
+            className="inline-flex items-center gap-1.5 rounded-md border border-line bg-surface-2 px-2 py-1 text-[10px] text-ink-2 transition-colors hover:border-line-strong hover:text-ink"
           >
             <Settings2 size={11} />
             {channelLabel(channel)}
@@ -215,7 +215,7 @@ export function AskPanel({ initialQuestion = "" }: { initialQuestion?: string })
               onClick={() => void submit(input)}
               disabled={busy || !input.trim()}
               aria-label="Ask the knowledge base"
-              className="flex h-8 w-8 items-center justify-center rounded-full bg-pine text-white transition-colors hover:bg-pine-dark disabled:bg-line-strong"
+              className="flex h-8 w-8 items-center justify-center rounded-full bg-pine text-white transition-colors hover:bg-pine-dark disabled:bg-line-strong disabled:text-ink-2"
             >
               {busy ? <Loader2 size={14} className="animate-spin" /> : <ArrowUp size={15} />}
             </button>

@@ -26,7 +26,7 @@ This is the first implementation slice of [support-knowledge-base-design-spec.md
 ## Stack
 
 - **Web:** Next.js 16 App Router, React 19, Tailwind CSS 4, lucide icons.
-- **API and worker:** FastAPI, psycopg 3, a committed-job polling worker.
+- **API and worker:** FastAPI, psycopg 3, and one elected polling worker per deployment (Postgres advisory lock). It requeues jobs left running by a crashed process.
 - **Database:** Postgres 16 + pgvector. One store for relational data, vectors, and full-text search.
 - **Intelligence:** OpenAI-compatible chat (including a fully local Ollama model), a local Sentence-Transformers embedding provider, and a deterministic offline provider for development.
 
@@ -37,7 +37,7 @@ Prerequisites: Docker, Python 3.12 with `uv`, Bun (or Node 20+ with npm), and `p
 ```bash
 cp .env.example .env
 make db               # Postgres + pgvector on 127.0.0.1:55432
-make migrate          # applies every migration in order
+make migrate          # applies new migrations; applied files are tracked
 make local-embeddings # optional: install the local GPU embedding stack
 make seed             # realistic messy corpus, conflicts, gaps, approved answers
 ```
@@ -88,7 +88,7 @@ On a 6 GB card, the chat model takes the GPU and the 0.6B embedder runs on the C
 1. **Add knowledge** — drop a document onto the home page or paste a URL. Harbour reads, classifies, links, and indexes it automatically; the source list updates on its own.
 2. **Ask** — ask “What is the refund window for annual plans?”. The answer comes from an approved canonical answer with two verified quotes.
 3. **Review** — only genuine decisions appear. Harbour drafts publish-ready answers for questions it can ground in sources, so most items are one click. Conflicts show a suggested source based on authority and recency. Press `J`/`K` to move, `A`/`R`/`D` to decide, and `N` to add a note. After a decision, press `U` (or **Undo** in the toast) within 15 seconds to revert it, including any answer, conflict, or version side effects.
-4. **Open a source** — the extracted text is the default view. Passages and processing details are tucked behind progressive disclosure, so the page stays readable.
+4. **Open a source** — the extracted text is the default view. Passages and processing details are tucked behind progressive disclosure, so the page stays readable. To remove sources, use the trash icon on a knowledge row, or choose **Select** to pick several and remove them at once; a source that is still being read is withdrawn when that read finishes. Decisions and conflicts tied to a removed source leave the review queue with it, and approved answers that cited it move to **Needs recheck** so the ready count stays honest.
 5. **Ask a gap** — ask “Do you offer a nonprofit discount?”. The system abstains and logs the question. If it finds enough evidence to draft an answer, that draft appears in Review ready to publish.
 6. **Public check** — open **Change** in the Ask composer and switch the channel to **Public help centre**. Internal answers and internal citations are not available.
 
@@ -132,18 +132,19 @@ Copy `.env.example` and keep the defaults for a local demo. Important variables:
 - `EMBEDDING_PROVIDER=local` — run embeddings on this machine with Sentence-Transformers. `dev` is the deterministic fallback; `openai` uses the endpoint's `/embeddings` route.
 - `LOCAL_EMBEDDING_MODEL` — defaults to `Qwen/Qwen3-Embedding-0.6B` (1024 dimensions, about 1.2 GB of VRAM at fp16). Set `LOCAL_EMBEDDING_DEVICE=cpu` when a local chat model is using the GPU.
 - `make local-chat*` — install, start, pull, and warm the local Ollama model documented above.
+- `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_PORT` — Docker bootstrap values, read by `docker compose`. Keep `MIGRATION_DATABASE_URL` in sync if you change them.
+- `OPENAI_EMBEDDING_DIMENSIONS` — defaults to `true` and asks OpenAI-compatible embedding endpoints for 1024 dimensions. Disable it only for a provider that rejects the optional parameter; the model must still return exactly `EMBEDDING_DIM` values.
 - `INTERNAL_LOW/HIGH_THRESHOLD` and `PUBLIC_LOW/HIGH_THRESHOLD` — abstention bands.
 - `API_URL`, `DEV_TENANT_SLUG`, `DEV_USER_EMAIL` — read by the Next server.
 
-The index uses 1024 dimensions (migration 006). After switching embedding models or providers, run `make reindex`; the migration clears stale vectors so the old and new models are never compared.
+The index uses 1024 dimensions (migration 006). After switching embedding models or providers, run `make reindex`; the migration clears stale vectors so the old and new models are never compared. `make api`, `make seed`, `make reindex`, and `make test` automatically include the local embedding extra only when `.env` sets `EMBEDDING_PROVIDER=local`; override with `UV_EXTRA=local-embeddings` or `UV_EXTRA=`.
 
 ## Verification
 
 ```bash
-make test
+make test      # API tests + web typecheck
+make check     # test, then the production web build
 curl -s http://127.0.0.1:8000/healthz
-cd apps/web && bun run typecheck
-cd apps/web && bun run build
 ```
 
 Manual checks that matter more than a build:

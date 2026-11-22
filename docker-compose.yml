@@ -1,20 +1,25 @@
 services:
   postgres:
-    image: vxcontrol/pgvector:latest
+    # Pinned to the digest currently used by this project. Upgrade deliberately:
+    # update the digest and re-run `make migrate` so pgvector stays compatible.
+    image: vxcontrol/pgvector@sha256:09afd689127bdb42319a133b2ef7cd4318b7ebda58412644975d6eacd2367fb0
     container_name: kb-postgres
     environment:
-      POSTGRES_USER: kb
-      POSTGRES_PASSWORD: kb_dev_password
-      POSTGRES_DB: kb
+      POSTGRES_USER: ${POSTGRES_USER:-kb}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kb_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-kb}
     ports:
-      - "127.0.0.1:55432:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-55432}:5432"
     volumes:
       - kb-pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U kb -d kb"]
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 3s
       retries: 20
 
 volumes:
   kb-pgdata:
+    # Keep the historical unprefixed name so existing data and `make clean-db`
+    # address the same volume regardless of the Compose project name.
+    name: kb-pgdata

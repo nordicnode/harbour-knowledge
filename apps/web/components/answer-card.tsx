@@ -9,6 +9,7 @@ import {
   Clipboard,
   FilePenLine,
   MessageSquareWarning,
+  ShieldAlert,
   ShieldCheck,
   ThumbsDown,
   ThumbsUp,
@@ -151,6 +152,7 @@ function Feedback({ result }: { result: AskResult }) {
 export function AnswerCard({ result }: { result: AskResult }) {
   const [copied, setCopied] = useState(false);
   const [showIgnored, setShowIgnored] = useState(false);
+  const unverifiedCitations = result.citations.filter((citation) => !citation.verified).length;
 
   if (result.abstained) {
     return (
@@ -218,9 +220,15 @@ export function AnswerCard({ result }: { result: AskResult }) {
               <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-faint">
                 Evidence · {result.citations.length}
               </p>
-              <span className="flex items-center gap-1 text-[10.5px] text-pine">
-                <ShieldCheck size={12} /> quotes verified
-              </span>
+              {unverifiedCitations ? (
+                <span className="flex items-center gap-1 text-[10.5px] text-rust">
+                  <ShieldAlert size={12} /> {unverifiedCitations} unverified
+                </span>
+              ) : (
+                <span className="flex items-center gap-1 text-[10.5px] text-pine">
+                  <ShieldCheck size={12} /> quotes verified
+                </span>
+              )}
             </div>
             <div className="overflow-hidden rounded-lg border border-line bg-surface-2">
               {result.citations.map((citation, index) => (

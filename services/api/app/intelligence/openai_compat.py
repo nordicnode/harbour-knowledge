@@ -64,8 +64,14 @@ class OpenAICompatIntelligence:
         model = self.settings.model_embed
         if not model:
             raise provider_unavailable("MODEL_EMBED is not configured.")
+        payload: dict[str, object] = {"model": model, "input": list(texts)}
+        # The pgvector column is fixed at 1024 dimensions. OpenAI's default is
+        # 1536, so request the index dimension explicitly unless the endpoint
+        # is known to reject the optional parameter.
+        if self.settings.openai_embedding_dimensions:
+            payload["dimensions"] = self.settings.embedding_dim
         try:
-            response = await self.embedding_client.embeddings.create(model=model, input=list(texts))
+            response = await self.embedding_client.embeddings.create(**payload)
         except RateLimitError as exc:
             raise rate_limited(str(exc)) from exc
         except APIConnectionError as exc:

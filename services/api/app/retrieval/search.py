@@ -122,17 +122,27 @@ async def hybrid_search(
         ),
     """
 
+    # `exact` means literal tokens, not English stems. The indexed bm25_text is
+    # built with the english configuration, so exact mode evaluates the simple
+    # configuration against the passage text instead of reusing that index.
+    if exact:
+        lexical_document = "to_tsvector('simple', p.text)"
+        lexical_query = "websearch_to_tsquery('simple', %(q)s)"
+    else:
+        lexical_document = "p.bm25_text"
+        lexical_query = "websearch_to_tsquery('english', %(q)s)"
+
     sql = f"""
       with
       {dense_cte}
       lexical as (
         select p.id, row_number() over (
-                 order by ts_rank_cd(p.bm25_text, websearch_to_tsquery('english', %(q)s)) desc
+                 order by ts_rank_cd({lexical_document}, {lexical_query}) desc
                ) as rn
         {joins}
         where {filters}
-          and p.bm25_text @@ websearch_to_tsquery('english', %(q)s)
-        order by ts_rank_cd(p.bm25_text, websearch_to_tsquery('english', %(q)s)) desc
+          and {lexical_document} @@ {lexical_query}
+        order by ts_rank_cd({lexical_document}, {lexical_query}) desc
         limit %(lexical_limit)s
       )
       select
