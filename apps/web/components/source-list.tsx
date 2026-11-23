@@ -20,6 +20,7 @@ import {
 import { deleteSourceAction, deleteSourcesAction } from "@/app/actions";
 import { cn } from "@/lib/cn";
 import { relativeTime } from "@/lib/format";
+import { sourceState, type SourceState } from "@/lib/source-state";
 import type { SourceRow } from "@/lib/types";
 import { Badge, Card } from "./ui";
 
@@ -35,23 +36,6 @@ const SOURCE_ICONS: Record<string, typeof FileText> = {
   markdown: FileText,
   epub: FileText,
 };
-
-type SourceState = "reading" | "ready" | "failed" | "removed";
-
-function sourceState(source: SourceRow): SourceState {
-  if (source.status === "withdrawn") return "removed";
-  if (source.status === "failed" || source.status === "quarantined" || source.job_status === "failed") {
-    return "failed";
-  }
-  if (
-    source.status === "processing" ||
-    source.job_status === "running" ||
-    source.job_status === "queued"
-  ) {
-    return "reading";
-  }
-  return "ready";
-}
 
 const SOURCE_STATE_META: Record<SourceState, { label: string; tone: "pine" | "sky" | "rust" | "neutral" }> = {
   reading: { label: "Reading…", tone: "sky" },

@@ -12,6 +12,13 @@ export interface Meta {
     embedding_provider: "dev" | "openai" | "local";
     embedding_version: string;
     embedding_dim: number;
+    embedding_identity: string;
+    index: {
+      compatible_passages: number;
+      stale_passages: number;
+      total_passages: number;
+      needs_reindex: boolean;
+    };
   };
   thresholds: {
     internal: { low: number; high: number };
@@ -57,6 +64,8 @@ export interface AskResult {
   qa_log_id: string;
   latency_ms: number;
   provider: string;
+  retrieval_mode: "hybrid" | "lexical_only" | "exact";
+  index_warning: string | null;
 }
 
 export interface Topic {
@@ -284,4 +293,6 @@ export interface SearchResponse {
   candidates_scanned: number;
   coverage: number;
   exact: boolean;
+  retrieval_mode: "hybrid" | "lexical_only" | "exact";
+  index_warning: string | null;
 }

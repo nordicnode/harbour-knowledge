@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import logging
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -14,20 +15,50 @@ from psycopg.types.json import Jsonb
 from ..config import Settings
 from ..deps import Session
 from ..errors import AppError, validation
-from ..intelligence import EvidencePassage, get_intelligence
-from ..intelligence.dev import tokenize
+from ..intelligence import EvidencePassage, GenerationResult, get_intelligence
+from ..intelligence.dev import match_tokens, tokenize
 from ..ingest.pipeline import quote_in_text
 from .search import (
     RetrievedPassage,
     band_for,
     confidence_composite,
+    has_detectable_contradiction,
     hybrid_search,
     lexical_faithfulness,
     retrieval_strength,
     vector_literal,
 )
 
-CANONICAL_MATCH_THRESHOLD = 0.36
+log = logging.getLogger(__name__)
+QUESTION_CANDIDATE_LIMIT = 30
+
+# Function words do not distinguish two questions. Negations, numbers,
+# qualifiers and named entities are still compared separately, so removing
+# these cannot make "before 30 days" match "after 30 days".
+QUESTION_STOPWORDS = frozenset("""
+    a an and are as at be been being but by can could did do does doing for from
+    had has have having how i if in into is it its me my of on or our ours should
+    so than that the their them then there these they this those to us was we were
+    what when where which while who whom why will with would you your
+""".split())
+
+# Hardware and unit acronyms usually describe the same subject rather than a
+# different one: "i5 9400" and "i5 9400 CPU" ask the same question. Named
+# products, plans, features and identifiers are not included here.
+GENERIC_HARDWARE_TERMS = frozenset(
+    "cpu gpu ram rom ssd hdd usb pc gb mb tb kb ghz mhz".split()
+)
+
+QUESTION_SYNONYMS = {
+    "processor": "cpu",
+    "processors": "cpu",
+    "chip": "cpu",
+    "chips": "cpu",
+    "core": "core",
+    "cores": "core",
+    "thread": "thread",
+    "threads": "thread",
+}
 
 
 @dataclass
@@ -78,16 +109,18 @@ def _supporting_quote(answer_md: str, passage_text: str, max_chars: int = 600) -
     to do with the claim. Instead, choose a sentence-like span that shares the
     answer's terms, then verify the returned text is literally in the passage.
     """
-    answer_terms = set(tokenize(re.sub(r"\[[0-9]+\]|\[P:[^\]]+\]", "", answer_md or "")))
+    answer_text = re.sub(r"\[[0-9]+\]|\[P:[^\]]+\]", "", answer_md or "")
+    answer_terms = set(match_tokens(answer_text))
     if not answer_terms or not passage_text.strip():
         return None
 
+    answer_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", answer_text) if s.strip()]
     candidates: list[tuple[float, int, int]] = []
     for match in re.finditer(r"[^.!?\n]+[.!?]?", passage_text):
         candidate = match.group().strip()
-        if len(candidate) < 25:
+        if not candidate:
             continue
-        terms = set(tokenize(candidate))
+        terms = set(match_tokens(candidate))
         if not terms:
             continue
         overlap = len(answer_terms & terms) / max(1, len(answer_terms))
@@ -95,13 +128,76 @@ def _supporting_quote(answer_md: str, passage_text: str, max_chars: int = 600) -
     if not candidates:
         return None
 
-    score, start, end = max(candidates, key=lambda item: (item[0], item[2] - item[1]))
-    if score <= 0:
-        return None
+    # If several answer claims are verbatim in this passage, keep their span
+    # together so the citation does not show only one of the supported claims.
+    exact = [
+        (start, end) for _, start, end in candidates
+        if any(quote_in_text(passage_text[start:end].strip(), sentence) for sentence in answer_sentences)
+    ]
+    if exact and max(end for _, end in exact) - min(start for start, _ in exact) <= max_chars:
+        start, end = min(start for start, _ in exact), max(end for _, end in exact)
+    else:
+        score, start, end = max(candidates, key=lambda item: (item[0], item[2] - item[1]))
+        if score <= 0:
+            return None
     quote = passage_text[start : min(end, start + max_chars)].strip()
-    if len(quote) < 20 or not quote_in_text(quote, passage_text):
+    if not quote or not quote_in_text(quote, passage_text):
         return None
     return quote
+
+
+def _table_fact_fallback(question: str, passages: list[RetrievedPassage]) -> GenerationResult | None:
+    """Return an exact, unambiguous attribute-table row for an identified model.
+
+    Never infer a value or a citation from the model's answer. The question must
+    name an explicit model, the table must identify that same model, and every
+    matching attribute row across retrieved tables must agree.
+    """
+    def model_ids(text: str) -> set[str]:
+        return {re.sub(r"[^a-z0-9]", "", match.group().lower()) for match in
+                re.finditer(r"\b[a-z]+\d+[\s-]*\d+[a-z]?\b", text, re.I)}
+
+    models = model_ids(question)
+    if len(models) != 1 or not passages:
+        return None
+    model = next(iter(models))
+    # Refuse to use a lower-ranked table when a similarly relevant top result
+    # belongs to another document; table rows often omit their subject.
+    top_document = passages[0].document_id
+    remaining = re.sub(r"\b[a-z]+\d+[\s-]*\d+[a-z]?\b", " ", question, flags=re.I)
+    terms = set(re.findall(r"[a-z0-9]+", remaining.lower())) - {
+        "how", "many", "much", "what", "is", "are", "does", "do", "the", "a", "an", "of",
+        "for", "have", "has", "its", "cpu", "processor", "product", "model", "number",
+    }
+    if not terms:
+        return None
+    matches: list[tuple[RetrievedPassage, str, str]] = []
+    for passage in passages:
+        lines = [line.strip() for line in passage.child_text.splitlines() if line.strip()]
+        if len(lines) < 3:
+            continue
+        cells = [[cell.strip() for cell in line.strip("|").split("|")] for line in lines if line.startswith("|") and line.endswith("|")]
+        if len(cells) != len(lines) or any(len(row) != 2 for row in cells):
+            continue
+        plain = lambda value: re.sub(r"[*`_]", "", value).strip().lower()
+        if plain(cells[0][0]) not in {"attribute", "property", "field"} or plain(cells[0][1]) not in {"specification", "value"}:
+            continue
+        identity_rows = [row for row in cells[2:] if plain(row[0]) in {"product name", "model", "model name"}]
+        if len(identity_rows) != 1 or model_ids(identity_rows[0][1]) != {model}:
+            continue
+        if any(model_ids(p.document_title) and model_ids(p.document_title) != {model}
+               for p in passages if p.document_id == passage.document_id):
+            continue
+        for line, row in zip(lines[2:], cells[2:]):
+            key_terms = set(re.findall(r"[a-z0-9]+", plain(row[0])))
+            if terms.issubset(key_terms) and row[1].strip():
+                matches.append((passage, line, plain(row[1])))
+    if not matches or not any(p.document_id == top_document for p, _, _ in matches):
+        return None
+    if len({value for _, _, value in matches}) != 1:
+        return None
+    passage, row, _ = next(match for match in matches if match[0].document_id == top_document)
+    return GenerationResult(answer_md=row, cited_ids=[str(passage.passage_id)])
 
 
 async def _historical_accuracy(conn: AsyncConnection, answer_id: UUID | None) -> float:
@@ -197,6 +293,114 @@ def _conflict_sources_ignored(conflicts: list[dict], own_passage_ids: set[str]) 
     return ignored
 
 
+def _question_safety_key(question: str) -> tuple:
+    """Keep critical qualifiers intact even if a model claims equivalence."""
+    text = question.casefold().replace("’", "'")
+    text = re.sub(r"\bcan't\b", "can not", text)
+    text = re.sub(r"\bwon't\b", "will not", text)
+    text = re.sub(r"\b([a-z]+)n't\b", r"\1 not", text)
+    text = re.sub(r"\bcannot\b", "can not", text)
+    numbers = tuple(re.findall(r"\b\d+(?:[.,]\d+)*\b", text))
+    words = set(re.findall(r"[a-z0-9]+", text))
+    intent = None
+    if "old" in words or "age" in words:
+        intent = "age"
+    elif "born" in words or "birth" in words:
+        intent = "birth"
+    elif "refund" in words or "refunded" in words:
+        if words & {"request", "apply", "claim", "obtain"}:
+            intent = "refund_request"
+        elif words & {"window", "long", "deadline", "period"}:
+            intent = "refund_window"
+    qualifiers = frozenset(re.findall(
+        r"\b(?:not|no|never|before|after|within|without|except|unless|only|"
+        r"at least|at most|more than|less than|annual|monthly|yearly|"
+        r"team|business|enterprise|today|current|previous|historical|was|were|will|would)\b", text,
+    ))
+    # Capitalized names and identifiers protect entity substitutions; generic
+    # initial question words are not entities.
+    entities = frozenset(re.sub(r"'s$", "", token.casefold()) for token in re.findall(
+        r"\b(?:[A-Z][a-z]+(?:'[sS])?|[A-Z]{2,}[A-Z0-9_-]*|[a-zA-Z]+[-_]\d+)\b", question
+    ) if token.casefold() not in {"what", "how", "where", "when", "why", "which", "who", "is", "does", "can", "do"}
+    and token.casefold() not in GENERIC_HARDWARE_TERMS)
+    return numbers, qualifiers, entities, intent
+
+
+def _question_content_terms(question: str) -> frozenset[str]:
+    """Content words that must agree before a deterministic reuse.
+
+    Numbers, entities, negation and qualifiers are checked by
+    `_question_safety_key`; this function only covers ordinary wording.
+    """
+    text = question.casefold().replace("’", "'")
+    text = re.sub(r"\b(can)not\b", r"\1 not", text)
+    text = re.sub(r"\b([a-z]+)n't\b", r"\1 not", text)
+    terms: set[str] = set()
+    for token in re.findall(r"[a-z0-9]+", text):
+        token = QUESTION_SYNONYMS.get(token, token)
+        if token.isdigit() or token in QUESTION_STOPWORDS or token in GENERIC_HARDWARE_TERMS:
+            continue
+        terms.add(token)
+    return frozenset(terms)
+
+
+def _question_search_terms(question: str) -> str:
+    # OR-query as a bounded candidate generator, never an equivalence decision.
+    tokens = list(dict.fromkeys(re.findall(r"[a-z0-9]+", question.casefold())))[:30]
+    return " OR ".join(tokens)
+
+
+async def _equivalent_question_rows(question: str, rows: list[dict]) -> list[dict]:
+    """Accept exact questions or model-confirmed candidates with matching safeguards."""
+    def exact_key(value: str) -> str:
+        return re.sub(r"\s+", " ", value.casefold().replace("’", "'")).strip(" ?.!\t\r\n")
+
+    exact = [row for row in rows if exact_key(row["question"]) == exact_key(question)]
+    if exact:
+        return exact
+    key = _question_safety_key(question)
+    content = _question_content_terms(question)
+    safe = []
+    deterministic = []
+    for row in rows:
+        candidate_key = _question_safety_key(row["question"])
+        if candidate_key[:3] != key[:3]:
+            continue
+        if key[3] and candidate_key[3] and key[3] != candidate_key[3]:
+            continue
+        safe.append(row)
+        # Identical content words after removing function words and generic
+        # hardware acronyms is stronger evidence than a model opinion. This is
+        # what lets "i5 9400" and "i5 9400 CPU" share one answer without
+        # weakening the entity, number, negation and qualifier checks above.
+        if (
+            len(content) >= 2
+            and candidate_key[3] == key[3]
+            and _question_content_terms(row["question"]) == content
+        ):
+            deterministic.append(row)
+    if deterministic:
+        return deterministic
+    if not safe:
+        return []
+    try:
+        intelligence = get_intelligence()
+        indices = await intelligence.equivalent_questions(question, [row["question"] for row in safe])
+        forward = [safe[index] for index in set(indices) if type(index) is int and 0 <= index < len(safe)]
+        # Require the same judgement in both directions. Too many matches are
+        # ambiguous and should not trigger automatic reuse.
+        if len(forward) > 3:
+            return []
+        matches = []
+        for row in forward:
+            if 0 in await intelligence.equivalent_questions(row["question"], [question]):
+                matches.append(row)
+        return matches
+    except AppError as exc:
+        log.warning("Question equivalence unavailable: %s", exc.code)
+        return []
+
+
 async def _canonical_match(
     conn: AsyncConnection,
     standalone: str,
@@ -206,59 +410,83 @@ async def _canonical_match(
     plan: str | None,
     product_version: str | None,
     channel: str,
+    as_of: date | None = None,
 ) -> tuple[dict | None, float]:
+    # Canonical versions currently lack effective-date semantics.
+    if as_of is not None:
+        return None, 0.0
     visibilities = ["public"] if channel == "public" else ["internal", "public"]
-    score_by_passage = {p.passage_id: p.rerank_score for p in retrieved}
-    ids = list(score_by_passage.keys())
-    rows: list[dict] = []
-    if ids:
-        rows = list(
-            await (
-                await conn.execute(
-                    """select ca.*, array_agg(ae.passage_id) as evidence_passage_ids
-                       from canonical_answers ca
-                       join answer_evidence ae
-                         on ae.answer_id = ca.id and ae.answer_version = ca.current_version
-                       where ca.status = 'approved'
-                         and ca.visibility = any(%s::text[])
-                         and ae.passage_id = any(%s::uuid[])
-                         and (cardinality(ca.plan_scope) = 0 or %s::text is null
-                              or %s::text = any(ca.plan_scope))
-                         and (cardinality(ca.version_scope) = 0 or %s::text is null
-                              or %s::text = any(ca.version_scope))
-                       group by ca.id""",
-                    (visibilities, ids, plan, plan, product_version, product_version),
-                )
-            ).fetchall()
-        )
-    exact = await (
-        await conn.execute(
-            """select ca.*, array_agg(ae.passage_id) as evidence_passage_ids
-               from canonical_answers ca
-               join answer_evidence ae
-                 on ae.answer_id = ca.id and ae.answer_version = ca.current_version
-               where ca.status = 'approved'
-                 and ca.visibility = any(%s::text[])
-                 and lower(trim(ca.question)) = lower(trim(%s))
-                 and (cardinality(ca.plan_scope) = 0 or %s::text is null or %s::text = any(ca.plan_scope))
-                 and (cardinality(ca.version_scope) = 0 or %s::text is null
-                      or %s::text = any(ca.version_scope))
-               group by ca.id""",
-            (visibilities, standalone, plan, plan, product_version, product_version),
-        )
-    ).fetchone()
+    ids = [p.passage_id for p in retrieved]
+    # Retrieved passages only shortlist candidates; their relevance is not
+    # evidence that the canonical *question* is equivalent.
+    rows = list(await (await conn.execute(
+        """select ca.* from canonical_answers ca
+           where ca.status = 'approved' and ca.visibility = any(%s::text[])
+             and exists (select 1 from answer_evidence ae
+                         where ae.answer_id = ca.id and ae.answer_version = ca.current_version)
+             and not exists (
+                 select 1 from answer_evidence ae
+                 join passages p on p.id = ae.passage_id
+                 join documents d on d.id = p.document_id
+                 join sources s on s.id = d.source_id
+                 where ae.answer_id = ca.id and ae.answer_version = ca.current_version
+                   and (p.status <> 'current' or d.status <> 'current' or s.status <> 'active'
+                     or s.deleted_at is not null or not (s.visibility = any(%s::text[]))
+                     or (cardinality(d.plan_scope) > 0 and (%s::text is null or
+                         not (lower(%s::text) = any(select lower(x) from unnest(d.plan_scope) x))))
+                     or (cardinality(d.product_version_scope) > 0 and (%s::text is null or
+                         not (lower(%s::text) = any(select lower(x) from unnest(d.product_version_scope) x))))
+                     or (d.effective_from is not null and d.effective_from > current_date)
+                     or (d.effective_to is not null and d.effective_to <= current_date))
+             )
+             and (cardinality(ca.plan_scope) = 0 or (%s::text is not null and
+                  lower(%s::text) = any(select lower(x) from unnest(ca.plan_scope) x)))
+             and (cardinality(ca.version_scope) = 0 or (%s::text is not null and
+                  lower(%s::text) = any(select lower(x) from unnest(ca.version_scope) x)))
+             and (lower(trim(ca.question)) = lower(trim(%s)) or exists (
+                 select 1 from answer_evidence ae where ae.answer_id = ca.id
+                   and ae.answer_version = ca.current_version and ae.passage_id = any(%s::uuid[])
+             ) or to_tsvector('english', ca.question) @@ websearch_to_tsquery('english', %s))
+           order by (lower(trim(ca.question)) = lower(trim(%s))) desc,
+             exists (select 1 from answer_evidence ae where ae.answer_id = ca.id
+                     and ae.answer_version = ca.current_version and ae.passage_id = any(%s::uuid[])) desc,
+             ts_rank(to_tsvector('english', ca.question), websearch_to_tsquery('english', %s)) desc,
+             ca.created_at, ca.id
+           limit %s""",
+        (visibilities, visibilities, plan, plan, product_version, product_version,
+         plan, plan, product_version, product_version, standalone, ids,
+         _question_search_terms(standalone), standalone, ids, _question_search_terms(standalone), QUESTION_CANDIDATE_LIMIT),
+    )).fetchall())
+    matches = await _equivalent_question_rows(standalone, rows)
+    if not matches:
+        return None, 0.0
+    # Prefer the matching explicit scope over a general answer, but abstain
+    # when equally specific answers are ambiguous rather than choosing one.
+    def specificity(row: dict) -> int:
+        return int(bool(row["plan_scope"])) + int(bool(row["version_scope"]))
 
-    best: dict | None = None
-    best_score = 0.0
-    for row in rows:
-        score = max((score_by_passage.get(pid, 0.0) for pid in row["evidence_passage_ids"]), default=0.0)
-        if score > best_score:
-            best, best_score = row, score
-    if exact is not None:
-        best, best_score = exact, max(best_score, 1.0)
-    if best is None or best_score < CANONICAL_MATCH_THRESHOLD:
-        return None, best_score
-    return best, best_score
+    best = max(specificity(row) for row in matches)
+    winners = [row for row in matches if specificity(row) == best]
+    if len(winners) > 1:
+        # Different phrasings can produce duplicate approved answers. Serving
+        # one is safe only when they say the same thing; otherwise abstain
+        # rather than picking an arbitrary conflicting answer.
+        if not all((row.get("answer_md") or "").strip() for row in winners):
+            return None, 0.0
+        answers = {
+            re.sub(r"\s+", " ", (row.get("answer_md") or "").casefold()).strip()
+            for row in winners
+        }
+        if len(answers) != 1:
+            return None, 0.0
+        winners.sort(key=lambda row: (
+            row.get("created_at") or datetime.max.replace(tzinfo=timezone.utc),
+            str(row.get("id") or ""),
+        ))
+        winners = winners[:1]
+    if len(winners) != 1:
+        return None, 0.0
+    return winners[0], 1.0
 
 
 async def _canonical_payload(
@@ -454,17 +682,39 @@ async def _maybe_propose_fallback(
     if not citations:
         return
 
-    existing = (
-        await (
-            await conn.execute(
-                """select id from canonical_answers
-                   where lower(question) = lower(%s) and status in ('draft','in_review')
-                   order by created_at desc limit 1""",
-                (standalone,),
-            )
-        ).fetchone()
-    )
-    answer_id = existing["id"] if existing else None
+    # Serialize draft matching and creation per tenant. Different phrasings
+    # otherwise race through the equivalence check and create two drafts.
+    await conn.execute("select pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                       (f"fallback-question:{session.tenant_id}",))
+    citation_ids = [UUID(citation["passage_id"]) for citation in citations]
+    rows = list(await (await conn.execute(
+        """select ca.id, ca.question, ca.status from canonical_answers ca
+           where ca.status in ('draft','in_review','approved')
+             and ca.visibility = 'internal'
+             and (select array_agg(lower(x) order by lower(x)) from unnest(ca.plan_scope) x)
+                 is not distinct from (select array_agg(lower(x) order by lower(x)) from unnest(%s::text[]) x)
+             and (select array_agg(lower(x) order by lower(x)) from unnest(ca.version_scope) x)
+                 is not distinct from (select array_agg(lower(x) order by lower(x)) from unnest(%s::text[]) x)
+             and (lower(trim(ca.question)) = lower(trim(%s)) or exists (
+                 select 1 from answer_evidence ae where ae.answer_id = ca.id
+                   and ae.answer_version = ca.current_version and ae.passage_id = any(%s::uuid[])
+             ) or to_tsvector('english', ca.question) @@ websearch_to_tsquery('english', %s))
+           order by (lower(trim(ca.question)) = lower(trim(%s))) desc,
+             exists (select 1 from answer_evidence ae where ae.answer_id = ca.id
+                     and ae.answer_version = ca.current_version and ae.passage_id = any(%s::uuid[])) desc,
+             ts_rank(to_tsvector('english', ca.question), websearch_to_tsquery('english', %s)) desc,
+             ca.created_at, ca.id
+           limit %s""",
+        ([plan] if plan else [], [product_version] if product_version else [], standalone,
+         citation_ids, _question_search_terms(standalone), standalone, citation_ids,
+         _question_search_terms(standalone), QUESTION_CANDIDATE_LIMIT),
+    )).fetchall())
+    existing = await _equivalent_question_rows(standalone, rows)
+    if existing:
+        # Never mutate an existing review item, answer, or its evidence merely
+        # because a paraphrase was asked; one review remains authoritative.
+        return
+    answer_id = None
 
     if answer_id is None:
         row = (
@@ -524,7 +774,7 @@ async def _maybe_propose_fallback(
                 "evidence_count": len(citations),
                 "summary": "Harbour drafted this from your sources. Publish it if it reads right.",
             }),
-            f"fallback:{normalise_question(standalone)}",
+            f"new_answer:{answer_id}",
         ),
     )
 
@@ -559,12 +809,13 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
     evidence_ids = [p.passage_id for p in outcome.passages]
 
     canonical, canonical_score = await _canonical_match(
-        conn, standalone, outcome.passages, session, settings, plan, product_version, audience
+        conn, standalone, outcome.passages, session, settings, plan, product_version, audience, request.as_of
     )
 
     conflicts: list[dict] = []
     conflict_notice = None
     sources_ignored: list[dict] = []
+    unsafe_canonical = False
     if canonical:
         citations, canonical_evidence, stale = await _canonical_payload(conn, canonical, audience)
         citation_dicts = [c.as_dict() for c in citations]
@@ -579,7 +830,14 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
         composite = confidence_composite(canonical_retrieval, faithfulness, historical)
         band = band_for(composite, audience, settings)
 
-        if audience == "public" and (stale or not citations or composite < settings.public_low_threshold):
+        if conflicts or has_detectable_contradiction(canonical["answer_md"], canonical_evidence + outcome.passages[:6]):
+            sources_ignored.append({
+                "title": canonical["question"],
+                "reason": "Evidence contradicts this answer or has an unresolved conflict; review is required.",
+            })
+            unsafe_canonical = True
+            canonical = None
+        elif audience == "public" and (stale or not citations or composite < settings.public_low_threshold):
             reason = "The approved answer's evidence changed since approval and is no longer safe to serve publicly."
             sources_ignored.append({"title": canonical["question"], "reason": reason})
             canonical = None
@@ -626,6 +884,8 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
                 "qa_log_id": str(qa_log_id),
                 "latency_ms": latency_ms,
                 "provider": intelligence.name,
+                "retrieval_mode": outcome.dense_index,
+                "index_warning": outcome.index_warning,
             }
 
     low, high = (
@@ -635,7 +895,9 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
     )
 
     abstain_reason = None
-    if audience == "public":
+    if unsafe_canonical:
+        abstain_reason = "The approved answer has conflicting evidence and needs review."
+    elif audience == "public":
         abstain_reason = "No approved public answer covers this question for the selected scope."
     elif not outcome.passages:
         abstain_reason = "No current passage in the knowledge base matched this question."
@@ -648,7 +910,7 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
         evidence = [
             EvidencePassage(
                 evidence_id=str(p.passage_id),
-                text=p.parent_text,
+                text=p.child_text,
                 title=p.document_title,
                 section_path=p.section_path,
                 source_date=_iso(p.effective_from),
@@ -669,16 +931,29 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
         valid_ids = {e.evidence_id for e in evidence}
         cited = [cid for cid in generation.cited_ids if cid in valid_ids]
         cited_passages = [p for p in outcome.passages if str(p.passage_id) in cited]
+        if not generation.abstain and generation.answer_md and not cited_passages:
+            # A small model can produce a malformed citation even when the
+            # answer is present. Retry once; never infer or guess an ID.
+            generation = await intelligence.generate_answer(standalone, evidence, _conflict_notice(top_conflicts))
+            cited = [cid for cid in generation.cited_ids if cid in valid_ids]
+            cited_passages = [p for p in outcome.passages if str(p.passage_id) in cited]
+        if not generation.abstain and generation.answer_md and not cited_passages:
+            # A structured table can support a precise extract without trusting
+            # the model's uncited number or guessing which passage it meant.
+            table_answer = _table_fact_fallback(standalone, outcome.passages[:6])
+            if table_answer:
+                generation = table_answer
+                cited_passages = [p for p in outcome.passages[:6] if str(p.passage_id) in generation.cited_ids]
         if generation.abstain or not generation.answer_md or not cited_passages:
             abstain_reason = "The answer could not be grounded in the retrieved evidence."
         else:
-            faithfulness = lexical_faithfulness(generation.answer_md, cited_passages)
-            if faithfulness < 0.35:
-                retry = await intelligence.generate_answer(standalone, evidence, conflict_notice)
+            faithfulness = lexical_faithfulness(generation.answer_md, cited_passages, outcome.passages[:6])
+            if faithfulness < 1.0:
+                retry = await intelligence.generate_answer(standalone, evidence, _conflict_notice(top_conflicts))
                 retry_cited = [cid for cid in retry.cited_ids if cid in valid_ids]
                 retry_passages = [p for p in outcome.passages if str(p.passage_id) in retry_cited]
-                retry_faithfulness = lexical_faithfulness(retry.answer_md, retry_passages)
-                if retry_faithfulness > faithfulness and retry_passages:
+                retry_faithfulness = lexical_faithfulness(retry.answer_md, retry_passages, outcome.passages[:6])
+                if not retry.abstain and retry.answer_md.strip() and retry_faithfulness == 1.0 and retry_passages:
                     generation, cited_passages, faithfulness = retry, retry_passages, retry_faithfulness
                 else:
                     abstain_reason = "The generated answer did not verify against its evidence."
@@ -693,6 +968,8 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
             )
             conflict_notice = _conflict_notice(conflicts)
             sources_ignored.extend(_conflict_sources_ignored(conflicts, cited_ids))
+            if conflicts and abstain_reason is None:
+                abstain_reason = "Cited sources have an unresolved conflict and need review."
 
             if abstain_reason is None:
                 historical = await _historical_accuracy(conn, None)
@@ -706,7 +983,8 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
                     answer_md = generation.answer_md
                     label = (
                         "> **Draft from unapproved sources.** This is not yet a canonical answer. "
-                        "Check the citations before sending it to a customer."
+                        "Check the citations before sending it to a customer. "
+                        "Time-sensitive facts may be out of date."
                     )
                     if band == "medium":
                         label += "\n>\n> **Review recommended.** The retrieved evidence only partly covers this question."
@@ -730,10 +1008,21 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
                                 verified=bool(quote and quote_in_text(quote, p.child_text)),
                             ).as_dict()
                         )
-                    await _maybe_propose_fallback(
-                        conn, session, standalone, generation.answer_md, cited_passages, citations,
-                        plan, product_version,
+                    citation_numbers = {
+                        citation["passage_id"]: index for index, citation in enumerate(citations, start=1)
+                    }
+                    # Only expose inline references that map to an actual returned citation.
+                    answer_md = re.sub(
+                        r"\[P:([^\]]+)\]",
+                        lambda match: f"[{citation_numbers[match.group(1)]}]"
+                        if match.group(1) in citation_numbers else "",
+                        answer_md,
                     )
+                    if request.as_of is None:
+                        await _maybe_propose_fallback(
+                            conn, session, standalone, generation.answer_md, cited_passages, citations,
+                            plan, product_version,
+                        )
                     latency_ms = int((time.perf_counter() - started) * 1000)
                     qa_log_id = await _log_qa(
                         conn, session, request, standalone, "fallback", answer_md, citations,
@@ -765,6 +1054,8 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
                         "qa_log_id": str(qa_log_id),
                         "latency_ms": latency_ms,
                         "provider": intelligence.name,
+                        "retrieval_mode": outcome.dense_index,
+                        "index_warning": outcome.index_warning,
                     }
 
     # Abstention is a result, not an error. Log it and grow the gap record.
@@ -805,6 +1096,8 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
         "qa_log_id": str(qa_log_id),
         "latency_ms": latency_ms,
         "provider": intelligence.name,
+        "retrieval_mode": outcome.dense_index,
+        "index_warning": outcome.index_warning,
     }
 
 

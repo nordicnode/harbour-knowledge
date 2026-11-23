@@ -1,0 +1,184 @@
+{
+  "version": "synthetic-v1",
+  "description": "Small synthetic starter set; expand with reviewed real-world examples before using it as a quality benchmark.",
+  "sources": [
+    {
+      "id": "mikey",
+      "title": "Mikey test facts",
+      "filename": "mikey.txt",
+      "visibility": "internal",
+      "text": "Mikey is 40 years old.\nMikey was born on August 8th, 1986.\n"
+    },
+    {
+      "id": "refund",
+      "title": "Refund policy",
+      "filename": "refund.md",
+      "visibility": "public",
+      "text": "# Annual refunds\n\nAnnual subscriptions can be refunded within 14 days of the initial purchase. Contact support with the invoice number to request a refund.\n"
+    },
+    {
+      "id": "sync",
+      "title": "Card sync error E4021",
+      "filename": "sync.md",
+      "visibility": "public",
+      "text": "# Card sync\n\nE4021 means the card issuer connection failed. Reconnect the card and contact support if the error persists.\n"
+    },
+    {
+      "id": "internal",
+      "title": "Internal support note",
+      "filename": "internal.txt",
+      "visibility": "internal",
+      "text": "The internal escalation phrase is violet lighthouse. Only support staff should use this phrase.\n"
+    },
+    {
+      "id": "approvals-v1",
+      "title": "Approvals version 1",
+      "filename": "approvals-v1.txt",
+      "visibility": "public",
+      "version_scope": ["v1"],
+      "text": "In version 1, expenses under $50 are approved automatically. Expenses of $50 or more require manager approval.\n"
+    },
+    {
+      "id": "approvals-v2",
+      "title": "Approvals version 2",
+      "filename": "approvals-v2.txt",
+      "visibility": "public",
+      "version_scope": ["v2"],
+      "text": "In version 2, every expense requires manager approval. The automatic approval rule has been removed.\n"
+    }
+  ],
+  "canonical_answers": [
+    {
+      "id": "refund-window",
+      "question": "What is the refund window for annual subscriptions?",
+      "answer": "Annual subscriptions can be refunded within 14 days of the initial purchase.",
+      "source": "refund",
+      "quote": "Annual subscriptions can be refunded within 14 days of the initial purchase.",
+      "visibility": "public"
+    },
+    {
+      "id": "refund-request",
+      "question": "How do I request an annual refund?",
+      "answer": "Contact support with the invoice number to request a refund.",
+      "source": "refund",
+      "quote": "Contact support with the invoice number to request a refund.",
+      "visibility": "public"
+    }
+  ],
+  "cases": [
+    {
+      "id": "mikey-age",
+      "split": "development",
+      "question": "How old is Mikey?",
+      "channel": "web",
+      "expected_behavior": "answer",
+      "expected_answer": "The source states Mikey is 40 and was born on August 8, 1986; assess any current age against an explicit date.",
+      "relevant_evidence": [{"source": "mikey", "quote": "Mikey is 40 years old."}],
+      "notes": "Check time qualification and support of each claim manually."
+    },
+    {
+      "id": "refund-window-exact",
+      "split": "development",
+      "question": "What is the refund window for annual subscriptions?",
+      "channel": "public",
+      "expected_behavior": "answer",
+      "expected_canonical": "refund-window",
+      "expected_answer": "14 days from initial purchase.",
+      "relevant_evidence": [{"source": "refund", "quote": "Annual subscriptions can be refunded within 14 days of the initial purchase."}]
+    },
+    {
+      "id": "refund-request-exact",
+      "split": "development",
+      "question": "How do I request an annual refund?",
+      "channel": "public",
+      "expected_behavior": "answer",
+      "expected_canonical": "refund-request",
+      "expected_answer": "Contact support with the invoice number.",
+      "relevant_evidence": [{"source": "refund", "quote": "Contact support with the invoice number to request a refund."}]
+    },
+    {
+      "id": "error-code",
+      "split": "development",
+      "question": "What does error E4021 mean?",
+      "channel": "web",
+      "expected_behavior": "answer",
+      "expected_answer": "The card issuer connection failed.",
+      "relevant_evidence": [{"source": "sync", "quote": "E4021 means the card issuer connection failed."}]
+    },
+    {
+      "id": "unanswerable-public",
+      "split": "development",
+      "question": "Do you offer a nonprofit discount?",
+      "channel": "public",
+      "expected_behavior": "abstain",
+      "expected_answer": null,
+      "relevant_evidence": []
+    },
+    {
+      "id": "internal-only-public",
+      "split": "development",
+      "question": "What is the internal escalation phrase?",
+      "channel": "public",
+      "expected_behavior": "abstain",
+      "expected_answer": null,
+      "relevant_evidence": []
+    },
+    {
+      "id": "public-mikey",
+      "split": "development",
+      "question": "How old is Mikey?",
+      "channel": "public",
+      "expected_behavior": "abstain",
+      "expected_answer": null,
+      "relevant_evidence": []
+    },
+    {
+      "id": "approval-v1",
+      "split": "development",
+      "question": "Which expenses need approval in version 1?",
+      "channel": "web",
+      "product_version": "v1",
+      "expected_behavior": "answer",
+      "expected_answer": "Expenses of $50 or more require manager approval; smaller expenses are automatic.",
+      "relevant_evidence": [{"source": "approvals-v1", "quote": "Expenses of $50 or more require manager approval."}]
+    },
+    {
+      "id": "refund-paraphrase",
+      "split": "heldout",
+      "question": "How long after purchase can I get an annual subscription refunded?",
+      "channel": "public",
+      "expected_behavior": "answer",
+      "expected_canonical": "refund-window",
+      "expected_answer": "14 days from initial purchase.",
+      "relevant_evidence": [{"source": "refund", "quote": "Annual subscriptions can be refunded within 14 days of the initial purchase."}]
+    },
+    {
+      "id": "approval-v2",
+      "split": "heldout",
+      "question": "Which expenses need approval in version 2?",
+      "channel": "web",
+      "product_version": "v2",
+      "expected_behavior": "answer",
+      "expected_answer": "Every expense requires manager approval.",
+      "relevant_evidence": [{"source": "approvals-v2", "quote": "In version 2, every expense requires manager approval."}]
+    },
+    {
+      "id": "mikey-birth-date",
+      "split": "heldout",
+      "question": "When was Mikey born?",
+      "channel": "web",
+      "expected_behavior": "answer",
+      "expected_answer": "August 8, 1986.",
+      "relevant_evidence": [{"source": "mikey", "quote": "Mikey was born on August 8th, 1986."}]
+    },
+    {
+      "id": "unanswerable-mikey",
+      "split": "heldout",
+      "question": "What city was Mikey born in?",
+      "channel": "web",
+      "expected_behavior": "abstain",
+      "expected_answer": null,
+      "relevant_evidence": []
+    }
+  ]
+}

@@ -8,8 +8,10 @@ from uuid import UUID
 
 from psycopg import AsyncConnection
 
+from ..config import get_settings
+from ..db import fetch_one
 from ..intelligence import get_intelligence
-from ..intelligence.dev import tokenize
+from ..intelligence.dev import match_tokens
 
 RRF_K = 60
 DENSE_LIMIT = 60
@@ -58,6 +60,11 @@ class SearchOutcome:
     passages: list[RetrievedPassage]
     candidates_scanned: int
     query_coverage: float
+    # "hybrid" when dense and lexical candidates were fused, "lexical_only"
+    # when the dense index is unavailable for the active embedding identity,
+    # or "exact" for literal-token lookup.
+    dense_index: str = "hybrid"
+    index_warning: str | None = None
 
 
 FILTER_SQL = """
@@ -83,6 +90,33 @@ BASE_JOINS = """
 """
 
 
+async def _dense_index_state(conn: AsyncConnection, identity: str) -> tuple[bool, bool]:
+    """Report whether current vectors match the active identity.
+
+    The check intentionally ignores request scope: a plan-filtered query with no
+    matches is not evidence that the whole index is stale. RLS still limits the
+    rows to the current tenant.
+    """
+    row = await fetch_one(
+        conn,
+        """select
+             exists(select 1 from passages p
+                    join documents d on d.id = p.document_id
+                    join sources s on s.id = d.source_id
+                    where p.status = 'current' and p.level = 'chunk'
+                      and d.status = 'current' and s.status = 'active' and s.deleted_at is null
+                      and p.embedding is not null and p.embedding_identity = %s) as compatible,
+             exists(select 1 from passages p
+                    join documents d on d.id = p.document_id
+                    join sources s on s.id = d.source_id
+                    where p.status = 'current' and p.level = 'chunk'
+                      and d.status = 'current' and s.status = 'active' and s.deleted_at is null
+                      and p.embedding is not null) as any_embedded""",
+        (identity,),
+    )
+    return bool(row and row["compatible"]), bool(row and row["any_embedded"])
+
+
 async def hybrid_search(
     conn: AsyncConnection,
     query: str,
@@ -97,6 +131,8 @@ async def hybrid_search(
     visibility_override: list[str] | None = None,
 ) -> SearchOutcome:
     visibilities = visibility_override or (["public"] if channel == "public" else ["internal", "public"])
+    settings = get_settings()
+    identity = settings.embedding_identity
     params = {
         "q": query,
         "visibilities": visibilities,
@@ -105,6 +141,7 @@ async def hybrid_search(
         "as_of": as_of,
         "topic": topic_slug,
         "emb": vector_literal(embedding) if embedding else None,
+        "identity": identity,
         "dense_limit": DENSE_LIMIT,
         "lexical_limit": LEXICAL_LIMIT,
         "candidate_limit": CANDIDATE_LIMIT,
@@ -112,11 +149,28 @@ async def hybrid_search(
     filters = FILTER_SQL
     joins = BASE_JOINS
 
-    dense_cte = "dense as (select null::uuid as id, null::bigint as rn where false)," if (exact or not embedding) else f"""
+    use_dense = bool(embedding) and not exact
+    index_warning = None
+    if use_dense:
+        compatible, any_embedded = await _dense_index_state(conn, identity)
+        if not compatible:
+            use_dense = False
+            index_warning = (
+                "Stored embeddings were built with a different embedding configuration. "
+                "Search used keyword matching only until the index is rebuilt with `make reindex`."
+                if any_embedded
+                else "No passages have embeddings for the active configuration. "
+                "Search used keyword matching only until the index is built with `make reindex`."
+            )
+    dense_index = "exact" if exact else ("hybrid" if use_dense else "lexical_only")
+
+    dense_cte = "dense as (select null::uuid as id, null::bigint as rn where false)," if not use_dense else f"""
         dense as (
           select p.id, row_number() over (order by p.embedding <=> %(emb)s::vector) as rn
           {joins}
-          where {filters} and p.embedding is not null
+          where {filters}
+            and p.embedding is not null
+            and p.embedding_identity = %(identity)s
           order by p.embedding <=> %(emb)s::vector
           limit %(dense_limit)s
         ),
@@ -135,15 +189,17 @@ async def hybrid_search(
     sql = f"""
       with
       {dense_cte}
-      lexical as (
-        select p.id, row_number() over (
-                 order by ts_rank_cd({lexical_document}, {lexical_query}) desc
-               ) as rn
+      lexical_matches as (
+        select p.id, ts_rank_cd({lexical_document}, {lexical_query}) as rank_score
         {joins}
         where {filters}
           and {lexical_document} @@ {lexical_query}
-        order by ts_rank_cd({lexical_document}, {lexical_query}) desc
+        order by rank_score desc
         limit %(lexical_limit)s
+      ),
+      lexical as (
+        select id, row_number() over (order by rank_score desc) as rn
+        from lexical_matches
       )
       select
         p.id as passage_id, p.parent_id, p.text as child_text,
@@ -168,7 +224,10 @@ async def hybrid_search(
     cur = await conn.execute(sql, params)
     rows = list(await cur.fetchall())
     if not rows:
-        return SearchOutcome(passages=[], candidates_scanned=0, query_coverage=0.0)
+        return SearchOutcome(
+            passages=[], candidates_scanned=0, query_coverage=0.0,
+            dense_index=dense_index, index_warning=index_warning,
+        )
 
     intelligence = get_intelligence()
     documents = [
@@ -176,10 +235,10 @@ async def hybrid_search(
     ]
     scores = await intelligence.rerank(query, documents)
 
-    query_terms = set(tokenize(query))
+    query_terms = set(match_tokens(query))
     scored: list[tuple[float, dict]] = []
     for row, score in zip(rows, scores):
-        text_terms = set(tokenize(f"{row['document_title']} {row['section_path']} {row['child_text']}"))
+        text_terms = set(match_tokens(f"{row['document_title']} {row['section_path']} {row['child_text']}"))
         coverage = len(query_terms & text_terms) / max(1, len(query_terms))
         scored.append((score, row | {"coverage": coverage}))
     scored.sort(key=lambda item: item[0], reverse=True)
@@ -222,13 +281,15 @@ async def hybrid_search(
 
     coverage_union: set[str] = set()
     for item in kept[:5]:
-        coverage_union |= set(tokenize(f"{item.document_title} {item.section_path} {item.child_text}"))
+        coverage_union |= set(match_tokens(f"{item.document_title} {item.section_path} {item.child_text}"))
     query_coverage = len(query_terms & coverage_union) / max(1, len(query_terms))
 
     return SearchOutcome(
         passages=kept,
         candidates_scanned=len(rows),
         query_coverage=min(1.0, query_coverage),
+        dense_index=dense_index,
+        index_warning=index_warning,
     )
 
 
@@ -262,22 +323,92 @@ def band_for(composite: float, channel: str, settings) -> str:
     return "low"
 
 
-def lexical_faithfulness(answer_md: str, cited: Sequence[RetrievedPassage]) -> float:
-    """Fraction of answer sentences substantially supported by a cited passage."""
+def _grounding_sentences(text: str) -> list[str]:
+    """Split claims without discarding words, negation, numbers, or conditions."""
     import re
 
-    text = re.sub(r"\[[0-9]+\]|\[P:[^\]]+\]", "", answer_md or "")
-    text = re.sub(r"\*\*[^*]+\*\*", "", text)
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if len(s.strip()) > 25]
-    if not sentences:
-        return 0.0
-    evidence_terms = [set(tokenize(p.parent_text + " " + p.child_text)) for p in cited]
-    supported = 0
-    for sentence in sentences:
-        terms = set(tokenize(sentence))
-        if not terms:
+    text = re.sub(r"\[[0-9]+\]|\[P:[^\]]+\]", "", text or "")
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"(?m)^\s*(?:[-*]\s+|\d+[.)]\s+)", "", text)
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+|\n+", text) if part.strip()]
+
+
+def _grounding_normalize(text: str) -> str:
+    import re
+
+    return re.sub(r"\s+", " ", text).strip().casefold().rstrip(".!?")
+
+
+def _contradiction_signature(text: str) -> tuple[frozenset[str], frozenset[str], bool]:
+    """Identify a narrow class of opposite-polarity or numeric statements.
+
+    Equal content words are deliberately required: broad overlap can confuse
+    different subjects or conditions. This is a safeguard, not an NLI model.
+    """
+    import re
+
+    text = _grounding_normalize(text).replace("’", "'")
+    text = re.sub(r"\bcan't\b", "can not", text)
+    text = re.sub(r"\bwon't\b", "will not", text)
+    text = re.sub(r"\b(can)not\b", r"\1 not", text)
+    text = re.sub(r"\b([a-z]+)n't\b", r"\1 not", text)
+    text = re.sub(r"\bnon[- ]([a-z]+)\b", r"not \1", text)
+    words = re.findall(r"[a-z]+|\d+(?:[.,]\d+)*", text)
+    negative = any(word in {"not", "no", "never"} for word in words)
+    # Normalize common antonyms, without assuming that all antonyms are simple
+    # negations (e.g. 'expired' and 'valid' may have other meanings).
+    opposites = {"ineligible": "eligible", "unavailable": "available", "disabled": "enabled"}
+    normalized = []
+    for word in words:
+        if word in opposites:
+            negative = True
+            word = opposites[word]
+        normalized.append(word)
+    numbers = frozenset(word for word in normalized if word[0].isdigit())
+    ignored = {"not", "no", "never", "is", "are", "was", "were", "be", "been", "can", "could", "do", "does", "did", "the", "a", "an"}
+    content = frozenset(word for word in normalized if word not in ignored and not word[0].isdigit())
+    return content, numbers, negative
+
+
+def has_detectable_contradiction(answer_md: str, context: Sequence[RetrievedPassage]) -> bool:
+    """Detect narrowly matched opposite-polarity or numeric source statements."""
+    sentences = [sentence for passage in context for sentence in _grounding_sentences(passage.child_text)]
+    for claim in _grounding_sentences(answer_md):
+        content, numbers, negative = _contradiction_signature(claim)
+        if len(content) < 2:
             continue
-        best = max((len(terms & evidence) / len(terms) for evidence in evidence_terms), default=0.0)
-        if best >= 0.62:
+        for sentence in sentences:
+            other_content, other_numbers, other_negative = _contradiction_signature(sentence)
+            if content != other_content:
+                continue
+            if negative != other_negative and numbers == other_numbers:
+                return True
+            if negative == other_negative and numbers and other_numbers and numbers != other_numbers:
+                return True
+    return False
+
+
+def lexical_faithfulness(
+    answer_md: str,
+    cited: Sequence[RetrievedPassage],
+    context: Sequence[RetrievedPassage] | None = None,
+) -> float:
+    """Fraction of claims matching complete cited child sentences verbatim.
+
+    This conservative extractive check rejects paraphrases it cannot verify;
+    it is not a semantic entailment guarantee. Context is checked for a
+    narrow set of explicit contradictory claims before a match is accepted.
+    """
+    claims = _grounding_sentences(answer_md)
+    if not claims:
+        return 0.0
+    cited_sentences = [sentence for passage in cited for sentence in _grounding_sentences(passage.child_text)]
+    checked_context = context if context is not None else cited
+    supported = 0
+    for claim in claims:
+        normalized = _grounding_normalize(claim)
+        if not normalized or not any(normalized == _grounding_normalize(sentence) for sentence in cited_sentences):
+            continue
+        if not has_detectable_contradiction(claim, checked_context):
             supported += 1
-    return supported / len(sentences)
+    return supported / len(claims)

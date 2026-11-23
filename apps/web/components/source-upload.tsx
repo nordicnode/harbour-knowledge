@@ -106,8 +106,8 @@ export function SourceUpload() {
               <p className="truncate text-[12.5px] font-medium text-ink">
                 {pending ? "Reading your source…" : file ? file.name : "Drop a document, or click to choose"}
               </p>
-              <p className="mt-0.5 truncate text-[10.5px] text-faint">
-                {file ? `${humanSize(file.size)} · keeping the original` : "PDF, Word, slides, HTML, or text · up to 15 MB"}
+              <p className="mt-0.5 text-[10.5px] text-faint">
+                {file ? `${humanSize(file.size)} · keeping the original` : "PDF, DOCX, PPTX, HTML, TXT, Markdown, CSV or LOG · up to 15 MB"}
               </p>
             </div>
             {file && !pending ? (

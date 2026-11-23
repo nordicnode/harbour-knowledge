@@ -68,4 +68,6 @@ async def search_endpoint(
         "candidates_scanned": outcome.candidates_scanned,
         "coverage": round(outcome.query_coverage, 3),
         "exact": exact,
+        "retrieval_mode": outcome.dense_index,
+        "index_warning": outcome.index_warning,
     }

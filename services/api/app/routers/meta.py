@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
-from ..db import fetch_val
+from ..db import fetch_one, fetch_val
 from ..deps import Context, get_context
 from ..intelligence import get_intelligence
 
@@ -16,6 +16,22 @@ async def meta(ctx: Context = Depends(get_context)):
         ctx.conn,
         "select count(*) from review_items where status = 'pending'",
     )
+    identity = settings.embedding_identity
+    index = await fetch_one(
+        ctx.conn,
+        """select
+             count(*) filter (where p.embedding is not null and p.embedding_identity = %s) as compatible,
+             count(*) filter (
+               where p.embedding is not null and p.embedding_identity is distinct from %s
+             ) as stale,
+             count(*) as total
+           from passages p
+           join documents d on d.id = p.document_id
+           join sources s on s.id = d.source_id
+           where p.level = 'chunk' and p.status = 'current' and d.status = 'current'
+             and s.status = 'active' and s.deleted_at is null""",
+        (identity, identity),
+    ) or {"compatible": 0, "stale": 0, "total": 0}
     return {
         "workspace": {
             "slug": ctx.session.tenant_slug,
@@ -34,6 +50,13 @@ async def meta(ctx: Context = Depends(get_context)):
             "embedding_provider": settings.embedding_provider,
             "embedding_version": settings.embedding_version,
             "embedding_dim": settings.embedding_dim,
+            "embedding_identity": identity,
+            "index": {
+                "compatible_passages": int(index["compatible"] or 0),
+                "stale_passages": int(index["stale"] or 0),
+                "total_passages": int(index["total"] or 0),
+                "needs_reindex": int(index["stale"] or 0) > 0,
+            },
         },
         "thresholds": {
             "internal": {

@@ -1,9 +1,15 @@
 SHELL := /bin/bash
 .PHONY: db migrate api web seed reindex local-embeddings local-chat local-chat-install local-chat-pull local-chat-warm test check clean-db
 
+# Read a dotenv value without leaking its value into make output. Strip an
+# optional surrounding quote pair and an unquoted inline comment.
+define env_value
+$(shell sed -n 's/^[[:space:]]*$(1)[[:space:]]*=[[:space:]]*//p' .env 2>/dev/null | tail -n 1 | sed -e 's/[[:space:]]#.*$$//' -e 's/[[:space:]]*$$//' -e 's/^"\(.*\)"$$/\1/' -e "s/^'\(.*\)'$$/\1/" | tr -d '\r')
+endef
+
 # The local embedding stack is optional. Only ask uv for it when this workspace
 # is configured for local embeddings; `UV_EXTRA=... make api` overrides this.
-EMBEDDING_PROVIDER := $(shell sed -n 's/^[[:space:]]*EMBEDDING_PROVIDER[[:space:]]*=[[:space:]]*//p' .env 2>/dev/null | tail -n 1 | tr -d '[:space:]')
+EMBEDDING_PROVIDER := $(strip $(call env_value,EMBEDDING_PROVIDER))
 UV_EXTRA ?= $(if $(filter local,$(EMBEDDING_PROVIDER)),local-embeddings,)
 UV_RUN := uv run $(if $(UV_EXTRA),--extra $(UV_EXTRA),)
 
@@ -27,7 +33,22 @@ db:
 # Track applied files so a re-run is a no-op. Older databases that predate the
 # tracking table simply apply the idempotent migrations once more.
 migrate:
-	@url="$$(sed -n 's/^[[:space:]]*MIGRATION_DATABASE_URL[[:space:]]*=[[:space:]]*//p' .env 2>/dev/null | tail -n 1 | tr -d '\r')"; \
+	@set -euo pipefail; \
+	read_env() { \
+		local key="$$1" value; \
+		value="$$(sed -n "s/^[[:space:]]*$${key}[[:space:]]*=[[:space:]]*//p" .env 2>/dev/null | tail -n 1 | tr -d '\r')"; \
+		value="$${value%%[[:space:]]#*}"; \
+		value="$${value#"$${value%%[![:space:]]*}"}"; \
+		value="$${value%"$${value##*[![:space:]]}"}"; \
+		if [ "$${#value}" -ge 2 ] && [[ "$$value" == \"* && "$$value" == *\" ]]; then \
+			value="$${value:1:$${#value}-2}"; \
+		fi; \
+		if [ "$${#value}" -ge 2 ] && [[ "$$value" == \'* && "$$value" == *\' ]]; then \
+			value="$${value:1:$${#value}-2}"; \
+		fi; \
+		printf '%s' "$$value"; \
+	}; \
+	url="$${MIGRATION_DATABASE_URL:-$$(read_env MIGRATION_DATABASE_URL)}"; \
 	if [ -z "$$url" ]; then echo "MIGRATION_DATABASE_URL is missing from .env" >&2; exit 1; fi; \
 	psql "$$url" -v ON_ERROR_STOP=1 -c "\
 		create table if not exists schema_migrations (\
@@ -42,7 +63,7 @@ migrate:
 			continue; \
 		fi; \
 		echo "applying $$file"; \
-		psql "$$url" -v ON_ERROR_STOP=1 -1 -f "$$file" \
+		psql "$$url" -v ON_ERROR_STOP=1 --single-transaction -f "$$file" \
 			-c "insert into schema_migrations (version) values ('$$version')" >/dev/null; \
 	done
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from ..config import get_settings
 
@@ -29,12 +29,26 @@ def read_bytes(tenant_id: UUID, source_id: UUID, storage_path: str) -> bytes:
     return path.read_bytes()
 
 
+def remove_snapshot(storage_path: str) -> None:
+    root = get_settings().storage_dir.resolve()
+    path = (root / storage_path).resolve()
+    if root not in path.parents:
+        raise ValueError("Storage path escapes the configured storage directory")
+    path.unlink(missing_ok=True)
+
+
 def store_snapshot(tenant_id: UUID, source_id: UUID, data: bytes, content_type: str) -> str:
     suffix = ".html"
     if "markdown" in content_type:
         suffix = ".md"
     elif "pdf" in content_type:
         suffix = ".pdf"
-    path = _source_path(tenant_id, source_id, suffix)
-    path.write_bytes(data)
+    # Snapshots are immutable: replacing the file referenced by the current
+    # source before its database transaction commits would corrupt a rollback.
+    path = _source_path(tenant_id, f"{source_id}-{uuid4().hex}", suffix)
+    try:
+        path.write_bytes(data)
+    except OSError:
+        path.unlink(missing_ok=True)
+        raise
     return str(path.relative_to(get_settings().storage_dir))

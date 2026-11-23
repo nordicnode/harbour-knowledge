@@ -17,3 +17,6 @@ __pycache__/
 .idea/
 storage/
 coverage/
+
+# Generated evaluation reports can contain document excerpts and answers.
+services/api/evaluation/baseline-*.json

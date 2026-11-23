@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
 PAGE_RE = re.compile(r"^<!--\s*page:\s*(\d+)\s*-->$")
+FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+RULE_RE = re.compile(r"^\s{0,3}(?:-{3,}|\*{3,}|_{3,})\s*$")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9“\"'(\[])")
 
 
@@ -41,15 +43,29 @@ def _is_table_block(lines: list[str]) -> bool:
 
 
 def _is_step_block(lines: list[str]) -> bool:
-    meaningful = [line for line in lines if line.strip()]
+    # A trailing horizontal rule is a separator, not a prose sentence. Ignore
+    # it so link-heavy lists can still split at their item boundaries.
+    meaningful = [line for line in lines if line.strip() and not RULE_RE.match(line)]
     return bool(meaningful) and all(re.match(r"^\s*(\d+[.)]|[-*])\s", line) for line in meaningful)
+
+
+def _fence_transition(line: str, fence: str | None) -> str | None:
+    match = FENCE_RE.match(line)
+    if not match:
+        return fence
+    marker, suffix = match.groups()
+    if fence is None:
+        return marker
+    if marker[0] == fence[0] and len(marker) >= len(fence) and not suffix.strip():
+        return None
+    return fence
 
 
 def _split_blocks(text: str) -> list[tuple[list[str], str | None]]:
     """Paragraph-aware blocks that keep tables, lists, and steps intact."""
     blocks: list[tuple[list[str], str | None]] = []
     current: list[str] = []
-    page: str | None = None
+    fence: str | None = None
 
     def flush() -> None:
         nonlocal current
@@ -59,14 +75,21 @@ def _split_blocks(text: str) -> list[tuple[list[str], str | None]]:
         while cleaned and not cleaned[-1].strip():
             cleaned.pop()
         if cleaned:
-            blocks.append((cleaned, page))
+            blocks.append((cleaned, None))
         current = []
 
     for raw in text.splitlines():
-        page_match = PAGE_RE.match(raw.strip())
-        if page_match:
+        next_fence = _fence_transition(raw, fence)
+        if fence is not None:
+            current.append(raw)
+            fence = next_fence
+            if fence is None:
+                flush()
+            continue
+        if next_fence is not None:
             flush()
-            page = page_match.group(1)
+            current.append(raw)
+            fence = next_fence
             continue
         if not raw.strip():
             if current and _is_table_block(current):
@@ -82,16 +105,62 @@ def _split_blocks(text: str) -> list[tuple[list[str], str | None]]:
     return blocks
 
 
+def split_oversized_chunk(text: str) -> list[str]:
+    """Split a too-large child without dropping text or inventing evidence.
+
+    Tables repeat only their actual header; splitting a single table row or code
+    block would destroy its structure, so those cases fail explicitly.
+    """
+    from ..errors import AppError
+
+    lines = text.splitlines()
+    if lines and FENCE_RE.match(lines[0]):
+        raise AppError("ingest_failed", "A code block exceeds the local embedding limit; split it into smaller blocks.")
+    if _is_table_block(lines):
+        if len(lines) < 3 or not re.fullmatch(r"[|:\-\s]+", lines[1]):
+            raise AppError("ingest_failed", "A table exceeds the local embedding limit and has no splittable header.")
+        rows = lines[2:]
+        if len(rows) < 2:
+            raise AppError("ingest_failed", "A table row exceeds the local embedding limit; split the source table.")
+        middle = len(rows) // 2
+        header = lines[:2]
+        return ["\n".join(header + rows[:middle]), "\n".join(header + rows[middle:])]
+
+    # Do not split in the middle of a sentence or identifier: doing so can
+    # separate a claim from its negation or exception. Lists split at item
+    # boundaries; prose only at sentence boundaries.
+    if _is_step_block(lines):
+        # Nested list lines belong to their parent item, not standalone steps.
+        candidates = [match.end() for match in re.finditer(r"\n(?=(?:\d+[.)]|[-*])\s)", text)
+                      if 0 < match.end() < len(text)]
+        # Never emit a separator-only passage just because it sits near the
+        # midpoint; both sides must still contain list or prose content.
+        candidates = [
+            position for position in candidates
+            if any(line.strip() and not RULE_RE.match(line) for line in text[:position].splitlines())
+            and any(line.strip() and not RULE_RE.match(line) for line in text[position:].splitlines())
+        ]
+    else:
+        candidates = [match.end() for match in SENTENCE_SPLIT_RE.finditer(text) if 0 < match.end() < len(text)]
+    if not candidates:
+        raise AppError(
+            "ingest_failed",
+            "A passage exceeds the local embedding limit and cannot be split safely; split the source text.",
+        )
+    midpoint = len(text) // 2
+    split = min(candidates, key=lambda position: abs(position - midpoint))
+    return [text[:split], text[split:]]
+
+
 def _split_sentences(text: str, target_tokens: int, overlap_tokens: int) -> list[str]:
+    if estimate_tokens(text) <= target_tokens:
+        return [text]
     compact = re.sub(r"\s+", " ", text).strip()
-    if estimate_tokens(compact) <= target_tokens:
-        return [compact]
     sentences = [s.strip() for s in SENTENCE_SPLIT_RE.split(compact) if s.strip()]
     if len(sentences) <= 1:
-        # A single long line with no sentence boundary: split on word boundaries only.
-        words = compact.split()
-        step = max(20, int(target_tokens * 4))
-        return [" ".join(words[i:i + step]) for i in range(0, len(words), step)]
+        # Preserve an indivisible sentence for the embedder's exact limit
+        # check rather than cutting off a condition or a long identifier.
+        return [text]
 
     chunks: list[str] = []
     current: list[str] = []
@@ -121,6 +190,8 @@ def chunk_markdown(
     markdown: str,
     doc_type: str = "faq",
     max_section_tokens: int = 1500,
+    *,
+    page_markers: bool = False,
 ) -> ChunkSet:
     """Heading-aware recursive chunking with parent sections and child chunks.
 
@@ -137,19 +208,28 @@ def chunk_markdown(
     current_lines: list[str] = []
     current_path = "Overview"
     current_page: str | None = None
+    fence: str | None = None
 
     def flush() -> None:
         nonlocal current_lines
-        body = "\n".join(current_lines).strip()
+        body = "\n".join(current_lines).strip("\n")
         if body:
             raw_sections.append((body, current_path, current_page))
         current_lines = []
 
     for line in lines:
-        page_match = PAGE_RE.match(line.strip())
+        page_match = PAGE_RE.match(line.strip()) if page_markers else None
         if page_match:
+            # PDF markers are inserted by the parser, even when extracted text
+            # happens to contain an unterminated Markdown fence.
+            flush()
             current_page = page_match.group(1)
+            fence = None
+            continue
+        next_fence = _fence_transition(line, fence)
+        if fence is not None or next_fence is not None:
             current_lines.append(line)
+            fence = next_fence
             continue
         heading = HEADING_RE.match(line.strip())
         if heading:
@@ -194,7 +274,7 @@ def chunk_markdown(
     chunks: list[Chunk] = []
     chunk_index = 0
     for body, path, page in pending:
-        text = re.sub(r"\n{3,}", "\n\n", body).strip()
+        text = body.strip("\n")
         if not text:
             continue
         sections.append(
@@ -209,18 +289,18 @@ def chunk_markdown(
         blocks = _split_blocks(text)
         child_texts: list[str] = []
         for block_lines, _block_page in blocks:
-            block_text = "\n".join(block_lines).strip()
+            block_text = "\n".join(block_lines).strip("\n")
             if not block_text:
                 continue
-            if _is_table_block(block_lines) or _is_step_block(block_lines):
+            if _is_table_block(block_lines) or _is_step_block(block_lines) or FENCE_RE.match(block_lines[0]):
                 child_texts.append(block_text)
                 continue
             child_texts.extend(_split_sentences(block_text, target, overlap))
         if not child_texts:
             child_texts = [text]
         for child in child_texts:
-            child = child.strip()
-            if not child:
+            child = child.strip("\n")
+            if not child.strip():
                 continue
             chunks.append(
                 Chunk(

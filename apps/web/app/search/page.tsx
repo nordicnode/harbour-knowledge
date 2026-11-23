@@ -121,6 +121,13 @@ export default async function SearchPage({
         <div className="rounded-xl border border-rust/25 bg-rust-soft px-4 py-3 text-[12px] text-rust">{error}</div>
       ) : null}
 
+      {result?.index_warning ? (
+        <div className="flex items-start gap-2 rounded-xl border border-amber/25 bg-amber-soft/60 px-4 py-3 text-[11.5px] leading-relaxed text-ink-2">
+          <SlidersHorizontal size={13} className="mt-0.5 shrink-0 text-amber" />
+          <span>{result.index_warning}</span>
+        </div>
+      ) : null}
+
       {!q || q.length < 2 ? (
         <EmptyState
           title="Search the evidence library"

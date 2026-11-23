@@ -3,8 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
-import traceback
 from datetime import date, datetime, timedelta, timezone
 from uuid import UUID
 
@@ -15,13 +15,17 @@ from ..config import get_settings
 from ..db import fetch_all, fetch_one, fetch_val, tenant_conn
 from ..errors import AppError
 from ..intelligence import EvidencePassage, TopicOption, get_intelligence
-from .chunker import chunk_markdown
-from .parsers import ParsedDocument, fetch_url, parse_bytes
-from .storage import read_bytes, store_snapshot
+from ..intelligence.local_embeddings import EmbeddingInputTooLong
+from .chunker import chunk_markdown, estimate_tokens, split_oversized_chunk
+from .parsers import ParsedDocument, fetch_url, parse_bytes, upload_format
+from .storage import read_bytes, remove_snapshot, store_snapshot
 
 log = logging.getLogger(__name__)
 
 PIPELINE_VERSION = "v1"
+# Bump when passage construction changes, so an explicit re-ingest rebuilds
+# stale indexes even when the normalized content hash remains unchanged.
+INDEXING_VERSION = "3"
 REVIEW_INTERVAL = {
     "pricing": 30,
     "policy": 30,
@@ -65,22 +69,8 @@ def redact(text: str) -> tuple[str, dict[str, int]]:
 
 
 def normalise(markdown: str) -> str:
-    text = markdown.replace("\r\n", "\n").replace("\r", "\n").replace("\ufeff", "")
-    lines: list[str] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith(">"):
-            continue
-        if re.match(r"^On .{10,} wrote:$", stripped):
-            continue
-        if re.match(r"^-{2,}\s*(original message|forwarded message)\s*-{2,}$", stripped, re.I):
-            continue
-        if re.fullmatch(r"\d{1,4}", stripped) and not line.startswith("<!--"):
-            continue
-        lines.append(line.rstrip())
-    text = "\n".join(lines)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    """Normalize line endings without guessing which source content is noise."""
+    return markdown.removeprefix("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _question_for(title: str, doc_type: str) -> str:
@@ -102,7 +92,9 @@ async def enqueue_job(conn: AsyncConnection, tenant_id: UUID, source_id: UUID, k
         """insert into ingest_jobs (tenant_id, source_id, idempotency_key, status, stage)
            values (%s, %s, %s, 'queued', 'intake')
            on conflict (tenant_id, idempotency_key)
-           do update set status = 'queued', stage = 'intake', error = null, updated_at = now()
+           do update set status = 'queued', stage = 'intake', error = null,
+                         stats = '{}'::jsonb, attempts = 0, started_at = null,
+                         finished_at = null, updated_at = now()
            returning id""",
         (tenant_id, source_id, key),
     )
@@ -137,7 +129,9 @@ async def _topics(conn: AsyncConnection) -> list[TopicOption]:
     return [TopicOption(**row) for row in rows]
 
 
-async def _read_source(conn: AsyncConnection, tenant_id: UUID, source: dict) -> tuple[bytes, ParsedDocument]:
+async def _read_source(
+    conn: AsyncConnection, tenant_id: UUID, source: dict, new_snapshots: list[str],
+) -> tuple[bytes, ParsedDocument]:
     settings = get_settings()
     if source["kind"] == "url":
         if not source["origin_url"]:
@@ -148,6 +142,7 @@ async def _read_source(conn: AsyncConnection, tenant_id: UUID, source: dict) -> 
             settings.url_fetch_timeout_seconds,
         )
         storage_path = store_snapshot(tenant_id, source["id"], data, content_type)
+        new_snapshots.append(storage_path)
         digest = hashlib.sha256(data).hexdigest()
         await conn.execute(
             """update sources
@@ -167,7 +162,10 @@ async def _read_source(conn: AsyncConnection, tenant_id: UUID, source: dict) -> 
         raise AppError("ingest_failed", "The uploaded file is missing from storage.")
     data = read_bytes(tenant_id, source["id"], source["storage_path"])
     filename = (source.get("metadata") or {}).get("filename") or source["title"]
-    parsed = parse_bytes(filename, source["mime_type"], data, source["title"])
+    # Validate again for sources queued before upload format restrictions.
+    # This also prevents misleading MIME headers from changing the parser.
+    kind = upload_format(filename)
+    parsed = parse_bytes(filename, source["mime_type"], data, source["title"], kind=kind)
     return data, parsed
 
 
@@ -188,6 +186,32 @@ async def _supersede(conn: AsyncConnection, document: dict, today: date) -> None
     await conn.execute("update passages set status = 'superseded' where document_id = %s", (document["id"],))
 
 
+async def _mark_answers_for_recheck(conn: AsyncConnection, document_id: UUID) -> int:
+    """Take approved answers out of the ready set when their evidence is superseded.
+
+    Evidence stays pinned to the old version for audit; the answer must be
+    edited and re-approved against current passages before it can serve again.
+    Runs inside the replacement transaction, so a failed re-ingest reverts it.
+    """
+    rows = await fetch_all(
+        conn,
+        """with affected as (
+             select distinct ae.answer_id
+             from answer_evidence ae
+             join passages p on p.id = ae.passage_id
+             join canonical_answers ca
+               on ca.id = ae.answer_id and ca.current_version = ae.answer_version
+             where p.document_id = %s and ca.status = 'approved'
+           )
+           update canonical_answers ca
+           set status = 'needs_recheck', updated_at = now()
+           where ca.id in (select answer_id from affected)
+           returning ca.id""",
+        (document_id,),
+    )
+    return len(rows)
+
+
 async def _insert_document(
     conn: AsyncConnection,
     tenant_id: UUID,
@@ -201,6 +225,7 @@ async def _insert_document(
     today = date.today()
     if previous:
         await _supersede(conn, previous, today)
+        await _mark_answers_for_recheck(conn, previous["id"])
     version = (previous["version"] + 1) if previous else 1
     topic_id = None
     if classification.topic_slugs:
@@ -219,12 +244,14 @@ async def _insert_document(
         (
             tenant_id, source["id"], version, today, previous["id"] if previous else None,
             parsed.title, content_md, content_hash, classification.doc_type, topic_id,
-            parsed.parser, 1.0,
+            parsed.parser, None,
             json.dumps({
                 "tags": classification.tags,
                 "entities": classification.entities,
                 "summary": classification.summary,
                 "page_count": parsed.page_count,
+                "extraction": parsed.metadata,
+                "indexing_version": INDEXING_VERSION,
             }),
             source.get("plan_scope") or [],
             source.get("product_version_scope") or [],
@@ -267,41 +294,84 @@ async def _insert_passages(
     for chunk in chunk_set.chunks:
         by_section.setdefault(chunk.section_index, []).append(chunk)
 
-    for section_index, chunks in by_section.items():
-        section = chunk_set.sections[section_index]
-        blurbs: list[str] = []
-        for chunk in chunks:
-            blurbs.append(
-                await intelligence.contextualise(
-                    document["title"], chunk.section_path, chunk.text,
-                    document["plan_scope"], document["product_version_scope"],
-                )
-            )
-        vectors = await intelligence.embed(
-            [f"{blurb}\n\n{chunk.text}" for blurb, chunk in zip(blurbs, chunks)],
-            task="document",
+    async def contextualise(chunk, text: str) -> str:
+        return await intelligence.contextualise(
+            document["title"], chunk.section_path, text,
+            document["plan_scope"], document["product_version_scope"],
         )
-        for blurb, chunk, vector in zip(blurbs, chunks, vectors):
-            bm25_source = f"{chunk.section_path}\n{blurb}\n{chunk.text}"
+
+    chunk_index = 0
+    local_embeddings = getattr(intelligence, "embeddings", intelligence)
+    checker = getattr(local_embeddings, "check_embedding_lengths", None)
+    for section_index, chunks in by_section.items():
+        # Split over-limit source material before sending it to the chat model;
+        # no extra embeddings or regenerated context are needed for rejected text.
+        candidates = [(chunk, chunk.text, 0) for chunk in chunks]
+        if checker is not None:
+            while True:
+                try:
+                    await checker([text for _, text, _ in candidates])
+                    break
+                except EmbeddingInputTooLong as exc:
+                    chunk, text, depth = candidates[exc.index]
+                    if depth >= 32:
+                        raise AppError("ingest_failed", "A passage could not be split within the embedding limit.")
+                    candidates[exc.index:exc.index + 1] = [
+                        (chunk, part, depth + 1) for part in split_oversized_chunk(text)
+                    ]
+        pending = [(chunk, text, await contextualise(chunk, text), depth) for chunk, text, depth in candidates]
+        def embedding_inputs():
+            return [f"{blurb}\n\n{text}" if blurb else text for _, text, blurb, _ in pending]
+
+        while True:
+            try:
+                if checker is not None:
+                    await checker(embedding_inputs())
+                else:
+                    vectors = await intelligence.embed(embedding_inputs(), task="document")
+                break
+            except EmbeddingInputTooLong as exc:
+                chunk, text, blurb, depth = pending[exc.index]
+                # Prefer source evidence to a generated blurb when only the
+                # latter pushes an otherwise valid passage over the limit.
+                if blurb:
+                    pending[exc.index] = (chunk, text, "", depth)
+                    continue
+                if depth >= 32:
+                    raise AppError("ingest_failed", "A passage could not be split within the embedding limit.")
+                pieces = split_oversized_chunk(text)
+                replacement = [(chunk, part, await contextualise(chunk, part), depth + 1) for part in pieces]
+                pending[exc.index:exc.index + 1] = replacement
+        if checker is not None:
+            vectors = await intelligence.embed(embedding_inputs(), task="document")
+        if len(vectors) != len(pending) or any(
+            len(vector) != settings.embedding_dim or not all(math.isfinite(value) for value in vector)
+            for vector in vectors
+        ):
+            raise AppError("ingest_failed", "The embedding provider returned invalid or incomplete vectors.")
+        for (chunk, text, blurb, _), vector in zip(pending, vectors):
+            bm25_source = f"{chunk.section_path}\n{blurb}\n{text}"
             row = await fetch_one(
-                conn,
-                """insert into passages
-                     (tenant_id, document_id, document_version, parent_id, level, text, text_hash,
-                      chunk_index, section_path, page_ref, contextual_blurb, embedding, embedding_model,
-                      embedding_version, bm25_text, token_count, tags, status)
-                   values (%s, %s, %s, %s, 'chunk', %s, %s, %s, %s, %s, %s, %s::vector, %s, %s,
-                           to_tsvector('english', %s), %s, %s, 'current')
-                   returning id""",
-                (
-                    tenant_id, document["id"], document["version"], parent_ids[section_index],
-                    chunk.text, hashlib.sha256(chunk.text.encode()).hexdigest(), chunk.chunk_index,
-                    chunk.section_path, chunk.page_ref, blurb, _vector_literal(vector),
-                    settings.active_embedding_model, settings.embedding_version, bm25_source,
-                    chunk.token_count, document["metadata"].get("tags", []),
-                ),
-            )
+                    conn,
+                    """insert into passages
+                         (tenant_id, document_id, document_version, parent_id, level, text, text_hash,
+                          chunk_index, section_path, page_ref, contextual_blurb, embedding, embedding_model,
+                          embedding_version, embedding_identity, bm25_text, token_count, tags, status)
+                       values (%s, %s, %s, %s, 'chunk', %s, %s, %s, %s, %s, %s, %s::vector, %s, %s, %s,
+                               to_tsvector('english', %s), %s, %s, 'current')
+                       returning id""",
+                    (
+                        tenant_id, document["id"], document["version"], parent_ids[section_index],
+                        text, hashlib.sha256(text.encode()).hexdigest(), chunk_index,
+                        chunk.section_path, chunk.page_ref, blurb, _vector_literal(vector),
+                        settings.active_embedding_model, settings.embedding_version,
+                        settings.embedding_identity, bm25_source,
+                        estimate_tokens(text), document["metadata"].get("tags", []),
+                    ),
+                )
             assert row is not None
-            inserted.append({"id": row["id"], "text": chunk.text, "section_path": chunk.section_path})
+            inserted.append({"id": row["id"], "text": text, "section_path": chunk.section_path})
+            chunk_index += 1
     return inserted
 
 
@@ -557,12 +627,25 @@ async def _fail(
     stage: str,
     exc: Exception,
 ) -> None:
-    message = exc.message if isinstance(exc, AppError) else str(exc)
-    log.exception("ingestion failed at %s: %s", stage, message)
+    # Provider and SQL exceptions may contain credentials, prompts, or source
+    # text. Keep detailed diagnostics in the exception type and stage, not in
+    # persisted job errors or logs.
+    if isinstance(exc, AppError) and exc.code in {"validation", "ingest_failed"}:
+        message, _ = redact(exc.message)
+    elif isinstance(exc, AppError):
+        message = f"Ingestion failed: {exc.code}."
+    else:
+        message = f"Ingestion failed ({type(exc).__name__})."
+    log.error("ingestion failed at %s: %s", stage, message)
     await _set_job(conn, job_id, "failed", stage, message[:2000])
     await conn.execute(
-        "update sources set status = 'failed', updated_at = now() where id = %s",
-        (source_id,),
+        """update sources set status = case
+               when status = 'quarantined' then status
+               when exists (select 1 from documents where source_id = %s and status = 'current')
+                 then 'active' else 'failed' end,
+               updated_at = now()
+           where id = %s and deleted_at is null and status <> 'withdrawn'""",
+        (source_id, source_id),
     )
     if "ocr" in message.lower():
         await conn.execute(
@@ -587,24 +670,42 @@ async def run_ingest(
     user_id: UUID | None = None,
 ) -> None:
     stage = "parse"
+    new_snapshots: list[str] = []
+    # Commit the claim independently: if the worker is killed, stale-job
+    # recovery can see the running attempt and apply its retry limit.
     async with tenant_conn(tenant_id) as conn:
+        await conn.execute(
+            "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (str(source_id),),
+        )
+        claimed = await fetch_one(
+            conn,
+            """update ingest_jobs set status = 'running', stage = 'parse',
+                      started_at = now(), finished_at = null, error = null, updated_at = now()
+               where id = %s and source_id = %s and status = 'queued'
+               returning started_at, attempts""",
+            (job_id, source_id),
+        )
+    if claimed is None:
+        return
+
+    async with tenant_conn(tenant_id) as conn:
+        # Keep the source lock and job row lock outside the savepoint, so
+        # rollback and failure reporting remain serialized with withdrawal.
+        await conn.execute(
+            "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (str(source_id),),
+        )
+        current = await fetch_one(
+            conn,
+            """select id from ingest_jobs where id = %s and source_id = %s
+               and status = 'running' and started_at = %s and attempts = %s for update""",
+            (job_id, source_id, claimed["started_at"], claimed["attempts"]),
+        )
+        if current is None:
+            return
+        await conn.execute("savepoint ingest_attempt")
         try:
-            # Serialize ingestion with deletion for this source. The lock lives
-            # for the transaction, so a delete waits for an in-flight read
-            # instead of racing the finish update or deadlocking on job rows.
-            await conn.execute(
-                "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                (str(source_id),),
-            )
-            # Claim the job atomically so two workers cannot process it twice.
-            claimed = await fetch_one(
-                conn,
-                """update ingest_jobs set status = 'running', started_at = now(), updated_at = now()
-                   where id = %s and status = 'queued' returning id""",
-                (job_id,),
-            )
-            if claimed is None:
-                return
             await _set_job(conn, job_id, "running", "parse")
             source = await fetch_one(conn, "select * from sources where id = %s", (source_id,))
             if source is None:
@@ -612,12 +713,14 @@ async def run_ingest(
                     conn, job_id, "failed", "intake",
                     "The source was not visible when ingestion started. Re-queue the job.",
                 )
+                await conn.execute("release savepoint ingest_attempt")
                 return
-            if source["status"] == "withdrawn":
+            if source["status"] == "withdrawn" or source["deleted_at"] is not None:
                 await _set_job(conn, job_id, "failed", "intake", "This source was withdrawn.")
+                await conn.execute("release savepoint ingest_attempt")
                 return
 
-            _, parsed = await _read_source(conn, tenant_id, source)
+            _, parsed = await _read_source(conn, tenant_id, source, new_snapshots)
 
             stage = "normalise"
             await _set_job(conn, job_id, "running", stage)
@@ -629,12 +732,17 @@ async def run_ingest(
 
             previous = await _previous_document(conn, source_id)
             content_hash = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
-            if previous and previous["content_hash"] == content_hash:
+            if (
+                previous
+                and previous["content_hash"] == content_hash
+                and (previous.get("metadata") or {}).get("indexing_version") == INDEXING_VERSION
+            ):
                 await conn.execute(
                     "update sources set status = 'active', ingested_at = coalesce(ingested_at, now()), updated_at = now() where id = %s",
                     (source_id,),
                 )
                 await _set_job(conn, job_id, "succeeded", "unchanged", None, {"unchanged": True})
+                await conn.execute("release savepoint ingest_attempt")
                 return
 
             stage = "classify"
@@ -645,7 +753,9 @@ async def run_ingest(
             stage = "segment"
             await _set_job(conn, job_id, "running", stage)
             document = await _insert_document(conn, tenant_id, source, parsed, redacted, classification, topics)
-            chunk_set = chunk_markdown(parsed.markdown, classification.doc_type)
+            chunk_set = chunk_markdown(
+                parsed.markdown, classification.doc_type, page_markers=parsed.parser == "pypdf"
+            )
             if not chunk_set.chunks:
                 raise AppError("ingest_failed", "The document produced no passages.")
 
@@ -678,11 +788,8 @@ async def run_ingest(
                 (source_id,),
             )
             if finished is None:
-                await _set_job(
-                    conn, job_id, "failed", "withdrawn",
-                    "The source was removed during ingestion.",
-                )
-                return
+                stage = "withdrawn"
+                raise AppError("ingest_failed", "The source was removed during ingestion.")
             stats = {
                 "sections": len(chunk_set.sections),
                 "passages": len(passages),
@@ -699,6 +806,14 @@ async def run_ingest(
                    values (%s, %s, %s, 'source.ingested', 'source', %s, %s)""",
                 (tenant_id, "user" if user_id else "system", user_id, source_id, Jsonb(stats)),
             )
+            await conn.execute("release savepoint ingest_attempt")
         except Exception as exc:  # noqa: BLE001 - job boundary records every failure
+            # Also clears PostgreSQL's failed-transaction state after SQL errors.
+            await conn.execute("rollback to savepoint ingest_attempt")
+            await conn.execute("release savepoint ingest_attempt")
+            for snapshot in new_snapshots:
+                try:
+                    remove_snapshot(snapshot)
+                except OSError:
+                    log.warning("could not remove failed ingest snapshot", exc_info=True)
             await _fail(conn, job_id, source_id, stage, exc)
-            log.debug("ingest traceback: %s", traceback.format_exc())

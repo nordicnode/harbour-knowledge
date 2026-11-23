@@ -19,14 +19,14 @@ This is the first implementation slice of [support-knowledge-base-design-spec.md
 | Gap clustering, gap status, coverage dashboard, recent-question metrics | Done |
 | Workspace UI: Knowledge home with one-step add and live source status, Ask, and Review only when a person is genuinely needed | Done |
 | Deterministic offline intelligence (`AI_MODE=dev`) so every path runs without an API key | Done |
-| OCR for screenshots and scanned PDFs | Not yet — image uploads are accepted but text extraction is next |
+| OCR for screenshots and scanned PDFs | Not yet — image uploads are not supported, and scanned PDFs need OCR before ingestion |
 | Real authentication / sessions | Not yet — development uses a header stub, and production fails closed |
 | Public help centre, widget, Discord bot, billing | Not yet |
 
 ## Stack
 
 - **Web:** Next.js 16 App Router, React 19, Tailwind CSS 4, lucide icons.
-- **API and worker:** FastAPI, psycopg 3, and one elected polling worker per deployment (Postgres advisory lock). It requeues jobs left running by a crashed process.
+- **API and worker:** FastAPI, psycopg 3, and one elected polling worker per deployment (Postgres advisory lock). It requeues jobs left running by a crashed process up to a bounded retry limit, then fails them.
 - **Database:** Postgres 16 + pgvector. One store for relational data, vectors, and full-text search.
 - **Intelligence:** OpenAI-compatible chat (including a fully local Ollama model), a local Sentence-Transformers embedding provider, and a deterministic offline provider for development.
 
@@ -51,7 +51,17 @@ make web         # http://127.0.0.1:3000
 
 Open http://127.0.0.1:3000. It lands on **Knowledge**: add a file or URL at the top, watch it process, and only open **Review** when Harbour flags a decision it cannot make alone. The seeded workspace is `harbour`; the development member is `Maya Chen` (`maya@harbour.example`, admin).
 
+Supported uploads have these extensions: `.pdf`, `.docx`, `.pptx`, `.html`, `.htm`, `.txt`, `.md`, `.markdown`, `.csv`, and `.log`. XLSX, EPUB, images, and files without a supported extension are rejected; export them to a supported format first. PDFs require an extractable text layer. Supported extensions do not guarantee that a malformed file or unsupported document structure can be parsed.
+
 `make seed` deletes and recreates the `harbour` tenant. It is the clean reset path for demos.
+
+Ingestion claims are persisted before processing; abandoned running jobs are requeued after 30 minutes, up to three recovery attempts. A failed replacement retains the last complete indexed version and reports the failed job. Manually re-queueing resets the recovery budget. URL snapshots are immutable; a crash can leave an unreferenced snapshot that is not automatically cleaned up.
+
+The local embedding provider checks its configured token limit before encoding. Oversized tables and passages may be split; an indivisible oversized table row, sentence, or code block fails with a message to split the source. Existing sources are not automatically re-ingested, and existing embeddings may already have been truncated. Re-ingestion creates a new document version and can require review of answers citing the older one. Remote embedding providers do not yet have equivalent truncation checks.
+
+Dense retrieval is gated by an embedding identity: provider, model, dimensions, query instruction, sequence limit, embedding version, and ingestion pipeline revision. A passage is only considered for dense ranking when its recorded identity matches the active configuration. If they differ, Search and Ask use keyword matching and say the index needs rebuilding instead of comparing incompatible vectors; `/v1/meta` reports compatible, stale, and total passage counts. After changing any of those settings, run `make reindex` for the default workspace. For another workspace, run `cd services/api && uv run --extra local-embeddings python -m app.reindex <slug>`. The rebuild embeds in committed batches, switches one workspace atomically, and resumes staged batches after an interruption. An older passage that exceeds the new limit stays out of the rebuilt index and must be re-ingested so the chunker can split it.
+
+To run the PostgreSQL ingestion failure tests against the migrated database, use `cd services/api && HARBOUR_TEST_POSTGRES=1 ./.venv/bin/python -m pytest -q tests/test_ingest_atomicity.py`. They create and remove an isolated temporary tenant and do not reset your workspace.
 
 ## Fully local chat
 
@@ -99,7 +109,7 @@ On a 6 GB card, the chat model takes the GPU and the 0.6B embedder runs on the C
 - **Evidence is frozen to a version.** `answer_evidence` rows point at a passage and store the exact quote used at approval time. Re-ingesting a source never silently repoints a citation.
 - **Edits create versions.** A workspace edit inserts a new `answer_versions` row, returns the answer to review, and stops it answering until re-approved.
 - **Visibility and scope are SQL filters.** They are applied to candidate passages before ranking, not passed to a model as an instruction.
-- **Abstention is a result.** A failed answer creates or increments a gap and writes a `qa_logs` row with retrieved evidence and scores.
+- **Abstention is a result.** A failed answer creates or increments a gap and writes a `qa_logs` row with retrieved evidence and scores. Internal generated fallback answers must match complete sentences from cited child passages; unsupported paraphrases and detected contradictions are rejected. This conservative check can miss semantic contradictions and can abstain on valid paraphrases, so it does not replace human review.
 - **Conflicts do not disappear.** They live in `conflicts` with a resolution/audit trail, independent of the review item that surfaced them.
 
 ## Project layout
@@ -137,7 +147,7 @@ Copy `.env.example` and keep the defaults for a local demo. Important variables:
 - `INTERNAL_LOW/HIGH_THRESHOLD` and `PUBLIC_LOW/HIGH_THRESHOLD` — abstention bands.
 - `API_URL`, `DEV_TENANT_SLUG`, `DEV_USER_EMAIL` — read by the Next server.
 
-The index uses 1024 dimensions (migration 006). After switching embedding models or providers, run `make reindex`; the migration clears stale vectors so the old and new models are never compared. `make api`, `make seed`, `make reindex`, and `make test` automatically include the local embedding extra only when `.env` sets `EMBEDDING_PROVIDER=local`; override with `UV_EXTRA=local-embeddings` or `UV_EXTRA=`.
+The index uses 1024 dimensions (migration 006). Changing the embedding provider, model, dimensions, query instruction, sequence limit, or `EMBEDDING_VERSION` changes the index identity. Run `make reindex` after any of those changes; until then dense retrieval is disabled for the workspace and the API reports keyword-only mode. `make reindex` rebuilds the default workspace only; pass another slug to `python -m app.reindex`. `make api`, `make seed`, `make reindex`, and `make test` automatically include the local embedding extra only when `.env` sets `EMBEDDING_PROVIDER=local`; override with `UV_EXTRA=local-embeddings` or `UV_EXTRA=`.
 
 ## Verification
 
@@ -146,6 +156,22 @@ make test      # API tests + web typecheck
 make check     # test, then the production web build
 curl -s http://127.0.0.1:8000/healthz
 ```
+
+### Evaluation baseline
+
+The synthetic evaluation exercises ingestion, retrieval, and Ask without resetting your workspace. It creates a temporary tenant and synthetic originals, runs each question independently, and rolls back all database writes. It requires the migrated database and the configured AI providers; it does **not** call `make seed` or alter existing knowledge. The corpus and labels are in [evaluation/corpus.json](services/api/evaluation/corpus.json).
+
+```bash
+cd services/api
+# Deterministic development baseline, using a new output filename each time:
+AI_MODE=dev EMBEDDING_PROVIDER=dev uv run python -m app.evaluate --split development --output evaluation/my-dev-baseline.json
+# Configured providers (include --extra local-embeddings when needed):
+uv run --extra local-embeddings python -m app.evaluate --split development --output evaluation/my-local-baseline.json
+# Reserve this split for comparisons after development/tuning:
+uv run --extra local-embeddings python -m app.evaluate --split heldout --output evaluation/my-heldout-report.json
+```
+
+Use the same configuration, corpus and split for comparisons. The starter set is tiny and synthetic, not a representative accuracy measurement; expand it with reviewed examples before setting thresholds. Reports include final retrieval ranks, abstentions, expected canonical selection, citation quote presence, ingestion and Ask wall time, and the generated answers for manual review. Quote presence does **not** prove support or correctness. Timings combine cold and warm requests and are not a hardware benchmark. The runner does not test HTTP uploads, worker polling, authentication, cross-tenant isolation, peak RAM/VRAM, or pre-rerank recall. Reports can contain document excerpts and answers; keep any private evaluation data and reports out of version control.
 
 Manual checks that matter more than a build:
 
@@ -161,6 +187,6 @@ Manual checks that matter more than a build:
 1. **OCR.** Add a `tesseract` parser stage for images and scanned PDFs, store OCR confidence as `parse_quality`, and create a `low_ocr` review item below threshold.
 2. **Auth.** Replace the development header stub with Clerk/Supabase/Auth.js and derive the tenant from the verified session. The current production guard intentionally returns 503.
 3. **Public help centre and channels.** Add a public read surface and one thin channel (widget or Discord) over the same answering contract.
-4. **Evaluation harness.** Build the golden and adversarial sets before tuning thresholds; the current bands are explicit defaults, not calibrated values.
+4. **Evaluation coverage.** The starter synthetic harness needs reviewed real-world golden and adversarial cases, human claim-support assessment, and held-out expansion before tuning thresholds; the current bands are explicit defaults, not calibrated values.
 5. **Semantic dedup and change impact.** Document-hash aliases exist; near-duplicate passage detection, topic discovery, and a richer change-impact pass remain.
 6. **Provider testing.** The OpenAI-compatible client is tested against local Ollama; a hosted-model matrix and more retrieval evaluation remain.

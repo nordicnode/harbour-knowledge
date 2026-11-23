@@ -6,6 +6,7 @@ import { SourceProgress } from "@/components/source-progress";
 import { SourceUpload } from "@/components/source-upload";
 import { Badge, Card, PageHeader } from "@/components/ui";
 import { apiGet } from "@/lib/api";
+import { sourceState } from "@/lib/source-state";
 import type { Answer, Meta, Overview, SourceRow } from "@/lib/types";
 
 export default async function KnowledgePage({
@@ -26,10 +27,7 @@ export default async function KnowledgePage({
   const readyAnswers = answerData.answers.filter((answer) => answer.status === "approved");
   const answers = readyAnswers.filter((answer) => !topic || answer.topic_slug === topic);
   const pending = overview.stats.pending_review;
-  const processing = sources.filter(
-    (source) =>
-      source.status === "processing" || source.job_status === "running" || source.job_status === "queued",
-  ).length;
+  const processing = sources.filter((source) => sourceState(source) === "reading").length;
   const topicName = topic ? answers[0]?.topic_name ?? null : null;
 
   return (

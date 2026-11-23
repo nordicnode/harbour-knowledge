@@ -43,6 +43,15 @@ def tokenize(text: str, keep_stop: bool = False) -> list[str]:
     return [t for t in tokens if t not in STOPWORDS and len(t) > 1]
 
 
+def match_tokens(text: str) -> list[str]:
+    """Normalize trailing sentence punctuation for lexical matching only.
+
+    Keep tokenize() unchanged for stored dev embeddings: changing its output
+    would require existing vectors to be reindexed.
+    """
+    return [cleaned for token in tokenize(text) if (cleaned := token.rstrip("._-"))]
+
+
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
 
@@ -89,15 +98,17 @@ class DevIntelligence:
 
     # -- reranking ----------------------------------------------------------
     async def rerank(self, query: str, documents: Sequence[str]) -> list[float]:
-        q_tokens = set(tokenize(query))
+        query_tokens = match_tokens(query)
+        q_tokens = set(query_tokens)
         if not q_tokens:
             return [0.0 for _ in documents]
-        q_pairs = {f"{a} {b}" for a, b in zip(tokenize(query), tokenize(query)[1:])}
+        q_pairs = {f"{a} {b}" for a, b in zip(query_tokens, query_tokens[1:])}
         q_vec = self._embed_one(query)
         scores: list[float] = []
         for doc in documents:
-            d_tokens = set(tokenize(doc))
-            d_pairs = {f"{a} {b}" for a, b in zip(tokenize(doc), tokenize(doc)[1:])}
+            doc_tokens = match_tokens(doc)
+            d_tokens = set(doc_tokens)
+            d_pairs = {f"{a} {b}" for a, b in zip(doc_tokens, doc_tokens[1:])}
             overlap = len(q_tokens & d_tokens) / len(q_tokens)
             phrase = 1.0 if q_pairs & d_pairs else 0.0
             d_vec = self._embed_one(doc)
@@ -151,6 +162,25 @@ class DevIntelligence:
             error_codes=error_codes,
             entities=entities,
         )
+
+    async def equivalent_questions(self, question: str, candidates: Sequence[str]) -> list[int]:
+        """Offline mode recognizes only exact text and unambiguous age variants."""
+        def key(value: str) -> str:
+            return re.sub(r"\s+", " ", value.casefold().replace("’", "'")).strip(" ?.! ")
+
+        def age_subject(value: str) -> str | None:
+            value = key(value)
+            patterns = (
+                r"how old is ([a-z][a-z0-9_-]*)",
+                r"what is ([a-z][a-z0-9_-]*)'s age",
+                r"what is the age of ([a-z][a-z0-9_-]*)",
+            )
+            return next((match.group(1) for pattern in patterns if (match := re.fullmatch(pattern, value))), None)
+
+        target = key(question)
+        subject = age_subject(question)
+        return [index for index, candidate in enumerate(candidates)
+                if key(candidate) == target or (subject is not None and age_subject(candidate) == subject)]
 
     async def contextualise(
         self,
@@ -280,6 +310,13 @@ class DevIntelligence:
         if not evidence:
             return GenerationResult(answer_md="", cited_ids=[], abstain=True)
 
+        # The development generator is extractive, not semantic. Do not answer
+        # a question with unrelated facts when its key terms are absent.
+        question_terms = set(match_tokens(question))
+        evidence_terms = set(match_tokens(" ".join(item.text for item in evidence)))
+        if not question_terms or not question_terms.issubset(evidence_terms):
+            return GenerationResult(answer_md="", cited_ids=[], abstain=True)
+
         ranked = self._rank_sentences(question, evidence)
         chosen: list[tuple[int, int, str, str]] = []
         used_ids: list[str] = []
@@ -297,8 +334,8 @@ class DevIntelligence:
         if conflict_notice:
             lines.append(f"**Heads up:** {conflict_notice}")
             lines.append("")
-        for index, (_e, _s, sentence, pid) in enumerate(chosen, start=1):
-            lines.append(f"{sentence} [{index}]")
+        for _e, _s, sentence, pid in chosen:
+            lines.append(f"{sentence} [{used_ids.index(pid) + 1}]")
         if len(used_ids) > len(chosen):
             used_ids = used_ids[: len(chosen)]
         return GenerationResult(answer_md="\n\n".join(lines), cited_ids=used_ids, abstain=False)

@@ -80,6 +80,8 @@ class Intelligence(Protocol):
 
     async def rewrite(self, question: str, history: Sequence[dict] | None = None) -> RewriteResult: ...
 
+    async def equivalent_questions(self, question: str, candidates: Sequence[str]) -> list[int]: ...
+
     async def contextualise(
         self,
         title: str,

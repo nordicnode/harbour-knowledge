@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -7,6 +9,11 @@ from typing import Literal
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT = Path(__file__).resolve().parents[3]
+
+# Bump when passage construction, tokenization, or embedding inputs change in a
+# way that makes previously stored vectors unsafe to reuse. Revision 2 marks the
+# first vectors produced only after enforcing the embedder's exact token limit.
+EMBEDDING_PIPELINE_REVISION = 2
 
 
 class Settings(BaseSettings):
@@ -117,6 +124,37 @@ class Settings(BaseSettings):
         if self.embedding_provider == "openai":
             return self.model_embed or self.embedding_model
         return self.embedding_model
+
+    @property
+    def embedding_identity(self) -> str:
+        """Fingerprint of everything that makes stored vectors comparable.
+
+        A passage is only eligible for dense retrieval when its identity equals
+        this value. Model, provider, dimensions, query instruction, embedding
+        version and ingestion pipeline revision all change the vector space or
+        the text that produced it, so any change requires a reindex.
+        """
+        material = {
+            "pipeline": EMBEDDING_PIPELINE_REVISION,
+            "provider": self.embedding_provider,
+            "model": self.active_embedding_model,
+            "dimensions": self.embedding_dim,
+            "version": self.embedding_version,
+            "query_instruction": (
+                self.local_embedding_query_instruction
+                if self.embedding_provider == "local"
+                else ""
+            ),
+            "max_sequence_length": (
+                self.local_embedding_max_seq_length
+                if self.embedding_provider == "local"
+                else None
+            ),
+        }
+        digest = hashlib.sha256(
+            json.dumps(material, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        return f"p{EMBEDDING_PIPELINE_REVISION}-{digest}"
 
     @property
     def is_dev(self) -> bool:

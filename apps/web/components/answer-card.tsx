@@ -44,6 +44,16 @@ function modePill(mode: AskResult["mode"]) {
   );
 }
 
+function IndexWarning({ warning }: { warning: string | null }) {
+  if (!warning) return null;
+  return (
+    <div className="mt-3 flex items-start gap-2 rounded-lg border border-amber/25 bg-amber-soft/60 px-3 py-2 text-[11px] leading-relaxed text-ink-2">
+      <ShieldAlert size={13} className="mt-0.5 shrink-0 text-amber" />
+      <span>{warning}</span>
+    </div>
+  );
+}
+
 function Feedback({ result }: { result: AskResult }) {
   const [vote, setVote] = useState<1 | -1 | 0>(0);
   const [pending, startTransition] = useTransition();
@@ -166,6 +176,7 @@ export function AnswerCard({ result }: { result: AskResult }) {
           <p className="mt-2 max-w-2xl text-[13.5px] leading-relaxed text-ink-2">
             {result.abstention_reason ?? "No approved answer covers this question for the selected scope."}
           </p>
+          <IndexWarning warning={result.index_warning} />
           <div className="mt-4 rounded-lg border border-line bg-surface-2 px-4 py-3">
             <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-faint">Searched</p>
             <p className="mt-1 text-[12px] text-ink-2">{result.searched_scope}</p>
@@ -209,6 +220,8 @@ export function AnswerCard({ result }: { result: AskResult }) {
             {copied ? "Copied" : "Copy reply"}
           </button>
         </div>
+
+        <IndexWarning warning={result.index_warning} />
 
         <div className="mt-4">
           <AnswerText text={result.answer_md ?? ""} />

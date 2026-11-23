@@ -51,27 +51,33 @@ export default async function SourcePage({ params }: { params: Promise<{ id: str
     sections.set(key, [...(sections.get(key) ?? []), passage]);
   }
   const latestJob = jobs[0];
-  const failed = source.status === "failed" || source.status === "quarantined" || latestJob?.status === "failed";
-  const processing = source.status === "processing" || latestJob?.status === "running" || latestJob?.status === "queued";
+  const removed = source.status === "withdrawn";
+  const failed =
+    !removed &&
+    (source.status === "failed" || source.status === "quarantined" || latestJob?.status === "failed");
+  const processing =
+    !removed &&
+    !failed &&
+    (source.status === "processing" || latestJob?.status === "running" || latestJob?.status === "queued");
   const canEdit = meta.member.role === "admin" || meta.member.role === "editor";
   const chunkCount = passages.filter((passage) => passage.level === "chunk").length;
   const statusLabel = alias_of
     ? "Duplicate"
-    : failed
-      ? "Couldn't read"
-      : processing
-        ? "Reading…"
-        : source.status === "withdrawn"
-          ? "Removed"
+    : removed
+      ? "Removed"
+      : failed
+        ? "Couldn't read"
+        : processing
+          ? "Reading…"
           : "Ready";
   const statusTone = alias_of
     ? "neutral"
-    : failed
-      ? "rust"
-      : processing
-        ? "sky"
-        : source.status === "withdrawn"
-          ? "neutral"
+    : removed
+      ? "neutral"
+      : failed
+        ? "rust"
+        : processing
+          ? "sky"
           : "pine";
 
   return (

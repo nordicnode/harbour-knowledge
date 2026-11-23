@@ -35,6 +35,9 @@ class HybridIntelligence:
     async def rewrite(self, question: str, history: Sequence[dict] | None = None) -> RewriteResult:
         return await self.chat.rewrite(question, history)
 
+    async def equivalent_questions(self, question: str, candidates: Sequence[str]) -> list[int]:
+        return await self.chat.equivalent_questions(question, candidates)
+
     async def contextualise(
         self,
         title: str,

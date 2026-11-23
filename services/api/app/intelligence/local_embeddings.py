@@ -5,9 +5,18 @@ import logging
 from typing import Sequence
 
 from ..config import Settings
-from ..errors import provider_unavailable
+from ..errors import AppError, provider_unavailable
 
 log = logging.getLogger(__name__)
+
+
+class EmbeddingInputTooLong(AppError):
+    def __init__(self, index: int, tokens: int | None, limit: int):
+        self.index = index
+        self.tokens = tokens
+        self.limit = limit
+        detail = f"{tokens} tokens; limit {limit}" if tokens is not None else "input too large to tokenize safely"
+        super().__init__("ingest_failed", f"Embedding input exceeds the local model limit ({detail}).")
 
 
 class LocalEmbeddingIntelligence:
@@ -77,7 +86,39 @@ class LocalEmbeddingIntelligence:
         )
         return model
 
+    def _check_lengths(self, model, inputs: list[str]) -> None:
+        # Count the same untruncated model input, including its default prompt
+        # and special tokens, before encode can silently truncate it.
+        prompt_name = getattr(model, "default_prompt_name", None)
+        prompt = (getattr(model, "prompts", {}) or {}).get(prompt_name, "") if prompt_name else ""
+        limit = model.max_seq_length
+        if not isinstance(limit, int) or limit <= 0:
+            raise provider_unavailable("The local embedding model has no usable sequence length limit.")
+        for index, text in enumerate(inputs):
+            # Bound untruncated tokenizer memory for very large or hostile files.
+            if len(prompt) + len(text) > 50000:
+                raise EmbeddingInputTooLong(index, None, limit)
+            if hasattr(model, "preprocess"):
+                features = model.preprocess(
+                    [text], prompt=prompt,
+                    processing_kwargs={"text": {"truncation": False}, "common": {"padding": False}},
+                )
+                ids = features.get("input_ids")
+                if ids is None or len(ids) != 1:
+                    raise provider_unavailable("Cannot validate local embedding token length for this model.")
+                tokens = len(ids[0])
+            else:
+                # Sentence Transformers 4/5 tokenize plain text with the
+                # underlying HF tokenizer and strip surrounding whitespace.
+                tokenizer = getattr(model, "tokenizer", None)
+                if tokenizer is None:
+                    raise provider_unavailable("Cannot validate local embedding token length for this model.")
+                tokens = len(tokenizer((prompt + text).strip(), truncation=False, add_special_tokens=True)["input_ids"])
+            if tokens > limit:
+                raise EmbeddingInputTooLong(index, tokens, limit)
+
     def _encode(self, model, inputs: list[str]) -> list[list[float]]:
+        self._check_lengths(model, inputs)
         vectors = model.encode(
             inputs,
             batch_size=self.settings.local_embedding_batch_size,
@@ -86,6 +127,12 @@ class LocalEmbeddingIntelligence:
             convert_to_numpy=True,
         )
         return [vector.tolist() for vector in vectors]
+
+    async def check_embedding_lengths(self, texts: Sequence[str]) -> None:
+        async with self._lock:
+            if self._model is None:
+                self._model = await asyncio.to_thread(self._load_model)
+            await asyncio.to_thread(self._check_lengths, self._model, list(texts))
 
     async def embed(self, texts: Sequence[str], task: str = "document") -> list[list[float]]:
         inputs = list(texts)
