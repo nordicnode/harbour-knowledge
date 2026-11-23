@@ -41,18 +41,41 @@ class Settings(BaseSettings):
     embedding_provider: Literal["dev", "openai", "local"] = "dev"
     openai_base_url: str = "https://api.openai.com/v1"
     openai_api_key: str = ""
+    # Keep local chat and remote embeddings on separate endpoints. Empty uses
+    # OPENAI_BASE_URL for both, which is the right default for a single provider.
+    openai_embedding_base_url: str = ""
     openai_embedding_api_key: str = ""
     model_ingest_small: str = ""
     model_rewrite: str = ""
     model_answer: str = ""
+    # Compound requests ask for several independent facts at once and benefit
+    # from a stronger model than a single short answer does. Empty reuses
+    # MODEL_ANSWER, so single-provider setups need no extra configuration.
+    model_answer_complex: str = ""
     model_judge: str = ""
     model_embed: str = ""
     # OpenAI-compatible embedding APIs support this. Providers that reject it
     # must still return EMBEDDING_DIM values, so disable only when necessary.
     openai_embedding_dimensions: bool = True
+    # NVIDIA NIM expects `input_type` on its asymmetric embedding models:
+    # "query" for questions and "passage" for indexed text. It must be enabled
+    # only for providers that accept the field.
+    openai_embedding_input_type: bool = False
+    # NVIDIA reasoning models such as Nemotron 3.5 spend the output budget on a
+    # reasoning trace by default, which can leave no visible answer and breaks
+    # strict JSON responses. Set this for NIM chat models that support
+    # chat_template_kwargs.enable_thinking.
+    openai_disable_thinking: bool = False
     model_rerank: str = ""
     rerank_base_url: str = ""
     rerank_api_key: str = ""
+    # Cohere-style providers expose /rerank with a documents array. NVIDIA NIM
+    # exposes /ranking with query.text and passages[].text, returning logits.
+    rerank_api_style: Literal["cohere", "nim"] = "cohere"
+    # Optional override, e.g. /reranking for NVIDIA's hosted per-model endpoint.
+    # Empty uses /rerank for Cohere-style providers and /ranking for NIM.
+    rerank_path: str = ""
+    rerank_timeout_seconds: float = 60.0
 
     embedding_dim: int = 1024
     embedding_model: str = "dev-hashed-v1"
@@ -98,11 +121,18 @@ class Settings(BaseSettings):
     db_pool_min: int = 1
     db_pool_max: int = 10
 
+    @property
+    def rerank_endpoint_path(self) -> str:
+        if self.rerank_path:
+            return self.rerank_path if self.rerank_path.startswith("/") else f"/{self.rerank_path}"
+        return "/ranking" if self.rerank_api_style == "nim" else "/rerank"
+
     def model_for(self, role: str) -> str:
         mapping = {
             "ingest_small": self.model_ingest_small,
             "rewrite": self.model_rewrite,
             "answer": self.model_answer,
+            "answer_complex": self.model_answer_complex or self.model_answer,
             "judge": self.model_judge,
             "embed": self.model_embed,
             "rerank": self.model_rerank,
@@ -176,6 +206,9 @@ class Settings(BaseSettings):
                 else None
             ),
         }
+        if self.embedding_provider == "openai":
+            # Enabling input_type changes the vector space for asymmetric models.
+            material["input_type"] = self.openai_embedding_input_type
         digest = hashlib.sha256(
             json.dumps(material, sort_keys=True).encode("utf-8")
         ).hexdigest()[:16]

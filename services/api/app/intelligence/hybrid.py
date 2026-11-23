@@ -8,6 +8,7 @@ from .base import (
     EvidencePassage,
     GenerationResult,
     Intelligence,
+    MultiGenerationResult,
     RewriteResult,
     TopicOption,
 )
@@ -66,3 +67,11 @@ class HybridIntelligence:
         conflict_notice: str | None = None,
     ) -> GenerationResult:
         return await self.chat.generate_answer(question, evidence, conflict_notice)
+
+    async def generate_multi_answer(
+        self,
+        questions: Sequence[str],
+        evidence: Sequence[EvidencePassage],
+        conflict_notice: str | None = None,
+    ) -> MultiGenerationResult:
+        return await self.chat.generate_multi_answer(questions, evidence, conflict_notice)

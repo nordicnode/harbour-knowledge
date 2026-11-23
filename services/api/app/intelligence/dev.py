@@ -12,9 +12,11 @@ from .base import (
     EvidencePassage,
     EvidenceQuote,
     GenerationResult,
+    MultiGenerationResult,
     RewriteResult,
     TopicOption,
 )
+from .questions import split_question_parts
 
 STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can", "could",
@@ -251,6 +253,7 @@ class DevIntelligence:
             product_version=version,
             error_codes=error_codes,
             entities=entities,
+            sub_questions=split_question_parts(standalone),
         )
 
     async def equivalent_questions(self, question: str, candidates: Sequence[str]) -> list[int]:
@@ -429,3 +432,16 @@ class DevIntelligence:
         if len(used_ids) > len(chosen):
             used_ids = used_ids[: len(chosen)]
         return GenerationResult(answer_md="\n\n".join(lines), cited_ids=used_ids, abstain=False)
+
+    async def generate_multi_answer(
+        self,
+        questions: Sequence[str],
+        evidence: Sequence[EvidencePassage],
+        conflict_notice: str | None = None,
+    ) -> MultiGenerationResult:
+        # The offline extractor has no notion of a shared section across parts;
+        # answering each independently is the honest equivalent.
+        return MultiGenerationResult([
+            await self.generate_answer(question, evidence, conflict_notice)
+            for question in questions
+        ])

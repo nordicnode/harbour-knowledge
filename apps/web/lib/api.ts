@@ -46,10 +46,14 @@ async function request(path: string, init: RequestInit, timeoutMs = 45_000): Pro
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (error) {
+    const timedOut =
+      error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
     throw new ApiError(
-      "The knowledge API is not reachable. Start it with `make api`.",
+      timedOut
+        ? "The knowledge API took too long to answer. Try again in a moment."
+        : "The knowledge API is not reachable. Start it with `make api`.",
       503,
-      "provider_unavailable",
+      timedOut ? "timeout" : "provider_unavailable",
       null,
     );
   }

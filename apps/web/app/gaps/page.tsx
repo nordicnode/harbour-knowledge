@@ -42,12 +42,12 @@ export default async function GapsPage({
             href={`/gaps?status=${tab.value}`}
             className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-[11.5px] transition-colors ${
               status === tab.value
-                ? "border-pine bg-pine text-white"
+                ? "border-pine bg-pine text-[#0c1711]"
                 : "border-line bg-surface text-ink-2 hover:border-line-strong hover:bg-surface-2"
             }`}
           >
             {tab.label}
-            <span className={status === tab.value ? "text-white/70" : "text-faint"}>{totals[tab.value] ?? 0}</span>
+            <span className={status === tab.value ? "text-[#0c1711]/70" : "text-faint"}>{totals[tab.value] ?? 0}</span>
           </Link>
         ))}
         <span className="ml-auto hidden items-center gap-1.5 text-[10.5px] text-faint sm:flex">

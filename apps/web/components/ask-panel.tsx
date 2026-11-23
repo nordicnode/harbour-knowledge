@@ -34,10 +34,22 @@ export function AskPanel({ initialQuestion = "" }: { initialQuestion?: string })
   const [messages, setMessages] = useState<Message[]>([]);
   const [busy, setBusy] = useState(false);
   const bottom = useRef<HTMLDivElement>(null);
+  const composer = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
-    bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    if (!messages.length) return;
+    const frame = requestAnimationFrame(() => {
+      const anchor = bottom.current;
+      if (!anchor) return;
+      // Keep the end of the newest reply above the sticky composer. A plain
+      // scrollIntoView aligns it to the viewport edge and the composer covers it.
+      const composerHeight = composer.current?.getBoundingClientRect().height ?? 0;
+      const target =
+        window.scrollY + anchor.getBoundingClientRect().bottom - window.innerHeight + composerHeight + 24;
+      window.scrollTo({ top: Math.max(0, target), behavior: "smooth" });
+    });
+    return () => cancelAnimationFrame(frame);
   }, [messages]);
 
   async function submit(question: string) {
@@ -116,7 +128,7 @@ export function AskPanel({ initialQuestion = "" }: { initialQuestion?: string })
           messages.map((message) =>
             message.role === "user" ? (
               <div key={message.id} className="flex justify-end">
-                <div className="max-w-[86%] rounded-[14px] rounded-br-[4px] bg-ink px-4 py-3 text-[13px] leading-relaxed text-[#f4f0e6]">
+                <div className="max-w-[86%] rounded-[14px] rounded-br-[4px] border border-pine/20 bg-pine-soft px-4 py-3 text-[13px] leading-relaxed text-ink">
                   {message.content}
                 </div>
               </div>
@@ -141,10 +153,11 @@ export function AskPanel({ initialQuestion = "" }: { initialQuestion?: string })
             ) : null,
           )
         )}
-        <div ref={bottom} />
+        <div ref={bottom} aria-hidden="true" />
       </div>
 
-      <Card className="sticky bottom-4 px-3 py-2.5 shadow-[0_8px_30px_rgba(23,26,22,0.08)]">
+      <div ref={composer} className="sticky bottom-4">
+        <Card className="px-3 py-2.5 shadow-[0_8px_30px_rgba(0,0,0,0.45)]">
         {scopeOpen ? (
           <div className="mb-2 grid gap-3 rounded-lg border border-line bg-surface-2/70 px-3 py-3 sm:grid-cols-3">
             <label className="block">
@@ -215,13 +228,14 @@ export function AskPanel({ initialQuestion = "" }: { initialQuestion?: string })
               onClick={() => void submit(input)}
               disabled={busy || !input.trim()}
               aria-label="Ask the knowledge base"
-              className="flex h-8 w-8 items-center justify-center rounded-full bg-pine text-white transition-colors hover:bg-pine-dark disabled:bg-line-strong disabled:text-ink-2"
+              className="flex h-8 w-8 items-center justify-center rounded-full bg-pine text-[#0c1711] transition-colors hover:bg-pine-dark disabled:bg-line-strong disabled:text-ink-2"
             >
               {busy ? <Loader2 size={14} className="animate-spin" /> : <ArrowUp size={15} />}
             </button>
           </div>
         </div>
-      </Card>
+        </Card>
+      </div>
     </div>
   );
 }

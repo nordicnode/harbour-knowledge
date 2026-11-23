@@ -28,7 +28,7 @@ This is the first implementation slice of [support-knowledge-base-design-spec.md
 - **Web:** Next.js 16 App Router, React 19, Tailwind CSS 4, lucide icons.
 - **API and worker:** FastAPI, psycopg 3, and one elected polling worker per deployment (Postgres advisory lock). It requeues jobs left running by a crashed process up to a bounded retry limit, then fails them.
 - **Database:** Postgres 16 + pgvector. One store for relational data, vectors, and full-text search.
-- **Intelligence:** OpenAI-compatible chat (including a fully local Ollama model), a local Sentence-Transformers embedding provider, and a deterministic offline provider for development.
+- **Intelligence:** OpenAI-compatible chat (including a fully local Ollama model), local or remote OpenAI-compatible embeddings, Cohere-style or NVIDIA NIM reranking, and a deterministic offline provider for development.
 
 ## Quick start
 
@@ -61,7 +61,7 @@ Separators are not knowledge: a horizontal rule or any other block without a let
 
 The local embedding provider checks its configured token limit before encoding. Oversized tables and passages may be split; an indivisible oversized table row, sentence, or code block fails with a message to split the source. Existing sources are not automatically re-ingested, and existing embeddings may already have been truncated. Re-ingestion creates a new document version and can require review of answers citing the older one. Remote embedding providers do not yet have equivalent truncation checks.
 
-Dense retrieval is gated by an embedding identity: provider, model, dimensions, query instruction, sequence limit, embedding version, and ingestion pipeline revision. A passage is only considered for dense ranking when its recorded identity matches the active configuration. If they differ, Search and Ask use keyword matching and say the index needs rebuilding instead of comparing incompatible vectors; `/v1/meta` reports compatible, stale, and total passage counts. After changing any of those settings, run `make reindex` for the default workspace. For another workspace, run `cd services/api && uv run --extra local-embeddings python -m app.reindex <slug>`. The rebuild embeds in committed batches, switches one workspace atomically, and resumes staged batches after an interruption. An older passage that exceeds the new limit stays out of the rebuilt index and must be re-ingested so the chunker can split it.
+Dense retrieval is gated by an embedding identity: provider, model, dimensions, query instruction, sequence limit, remote `input_type`, embedding version, and ingestion pipeline revision. A passage is only considered for dense ranking when its recorded identity matches the active configuration. If they differ, Search and Ask use keyword matching and say the index needs rebuilding instead of comparing incompatible vectors; `/v1/meta` reports compatible, stale, and total passage counts. After changing any of those settings, run `make reindex` for the default workspace. For another workspace, run `cd services/api && uv run --extra local-embeddings python -m app.reindex <slug>`. The rebuild embeds in committed batches, switches one workspace atomically, and resumes staged batches after an interruption. An older passage that exceeds the new limit stays out of the rebuilt index and must be re-ingested so the chunker can split it.
 
 **Upgrading from pipeline revision 2:** the embedded text of a passage changed (separators are no longer indexed and blurbs are per section), so the identity is now `p3-…`. Existing passages stay out of dense ranking until you re-ingest each source and then run `make reindex`; `make seed` is the clean reset for a demo workspace.
 
@@ -101,11 +101,61 @@ CPU inference does not benefit from large batches the way a GPU does. Sentence-T
 
 Repeated query strings are cached in-process (`LOCAL_EMBEDDING_QUERY_CACHE_SIZE=256` by default), so asking the same question again skips the CPU model entirely. Document embeddings are not cached because the index already stores them. `LOCAL_EMBEDDING_THREADS=0` uses PyTorch's default; on a 6-core machine that also runs the API and chat, try `4` and compare. A quantized ONNX build of Qwen3 was tested and rejected here: it preserved vectors (cosine ≥ 0.9996) but was slower than PyTorch on this CPU.
 
+### NVIDIA NIM embeddings and reranking
+
+Remote embeddings use the same `EMBEDDING_PROVIDER=openai` path as any OpenAI-compatible endpoint. A local 9router instance can route NVIDIA NIM embeddings. The tested 9router 0.5.123 setup needs the exact routed ID from its own request example, which is double-prefixed because 9router adds the provider prefix to the registry ID:
+
+```dotenv
+AI_MODE=openai
+# Keep local Ollama chat; send only embeddings through 9router.
+OPENAI_BASE_URL=http://127.0.0.1:11434/v1
+OPENAI_API_KEY=ollama
+OPENAI_EMBEDDING_BASE_URL=http://127.0.0.1:20128/v1
+OPENAI_EMBEDDING_API_KEY=<9router API key>
+EMBEDDING_PROVIDER=openai
+MODEL_EMBED=nvidia/nvidia/nemotron-3.5-embed-8b
+OPENAI_EMBEDDING_INPUT_TYPE=true
+OPENAI_EMBEDDING_DIMENSIONS=true
+```
+
+`OPENAI_EMBEDDING_BASE_URL` is optional. Leave it empty when chat and embeddings use the same endpoint; set it when a gateway such as 9router serves only the embedding model.
+
+To move chat off the local GPU as well, call NVIDIA's chat endpoint directly. 9router's current chat route returns 404 for these NVIDIA models even though its embedding route works. Nemotron 3.5 also reasons by default and can spend the entire output budget before producing a visible answer, so disable thinking for strict JSON responses:
+
+```dotenv
+OPENAI_BASE_URL=https://integrate.api.nvidia.com/v1
+OPENAI_API_KEY=<NVIDIA API key>
+MODEL_ANSWER=nvidia/nemotron-3.5-lightning-30b-a3b
+MODEL_ANSWER_COMPLEX=nvidia/nemotron-3-ultra-550b-a55b
+MODEL_REWRITE=nvidia/nemotron-3-ultra-550b-a55b
+MODEL_INGEST_SMALL=nvidia/nemotron-3.5-lightning-30b-a3b
+MODEL_JUDGE=nvidia/nemotron-3.5-lightning-30b-a3b
+OPENAI_DISABLE_THINKING=true
+```
+
+A stronger rewrite role makes follow-up questions substantially more reliable: `MODEL_REWRITE` sees the previous question and answer, replaces pronouns and back-references with the exact subject, and preserves qualifiers such as a plan or condition. It also handles canonical question-equivalence checks. `MODEL_ANSWER_COMPLEX` is used only for a request with several independent parts (for example, "When was it released? How many cores does it have?"); each part is retrieved separately, answered in one structured call, and retried individually if the combined reply omits a part. Leave it empty to reuse `MODEL_ANSWER`.
+
+`/v1/models/embedding` may list the single-prefixed name `nvidia/nemotron-3.5-embed-8b`; requests in this 9router version still use the provider-prefixed name above. NVIDIA NIM's asymmetric models reject requests without `input_type`, so the app sends `query` for questions and `passage` for indexed text. The output is requested at the index's 1024 dimensions; the model's native dimension is 4096 and supports Matryoshka truncation. Remote latency was highly variable in testing: an initial browser request embedded three passages in 0.78 s, but a later cold SDK run took 5.3 s for one query and 4.6 s for two passages. The local CPU provider measured 12.6 s for eight passages and about 0.34 s for a unique warm query, so remote can help bulk ingestion when the provider is warm but is not a guaranteed interactive speedup. Measure the 9router connections before switching; document text leaves the machine, so use this path only when that is acceptable.
+
+Changing to a remote embedder changes the index identity. Run `make reindex`; until it completes, dense retrieval reports keyword-only mode rather than comparing incompatible vectors. Remote inputs do not have the local provider's exact token-limit check; keep chunks within the provider's limit and treat silent remote truncation as unverified.
+
+9router does not currently expose a rerank route, so reranking must call a NIM endpoint directly. For NVIDIA's hosted reranker:
+
+```dotenv
+MODEL_RERANK=nvidia/nemotron-3.5-rerank-8b
+RERANK_API_STYLE=nim
+RERANK_BASE_URL=https://ai.api.nvidia.com/v1/retrieval/nvidia/nemotron-3.5-rerank-8b
+RERANK_PATH=/reranking
+RERANK_API_KEY=<NVIDIA API key>
+```
+
+For a local NIM container, use `RERANK_BASE_URL=http://127.0.0.1:8000/v1`, `RERANK_PATH=/ranking`, and the served model name (for example `nvidia/Nemotron-3.5-Rerank-8B-BF16`). NIM returns raw logits; the client maps them through a sigmoid to a monotonic 0–1 score. The abstention bands were calibrated on lexical/Cohere-style scores, so recalibrate them on labeled questions before trusting confidence bands with a new reranker. If the rerank endpoint is unavailable or returns an unusable response, search falls back to lexical scoring rather than failing the request.
+
 ### Answers that need no model call
 
 Two paths keep asking cheap on this hardware, and both are deterministic:
 
-- A question that is already standalone skips the rewrite call entirely. Only a follow-up (or a question that refers back with "it", "they", "that", or opens with "and"/"what about") is sent to the model to resolve.
+- With no conversation history, a question that already stands alone skips the rewrite call entirely. Once history exists, the rewrite model sees the previous question and answer and returns a subject-complete standalone query, or the same question when it already stands alone.
 - When the question names a product ("i5 9400") and asks for one stated attribute ("TDP", "cores", "cache"), Harbour extracts the exact two-column row from the top-ranked document and cites it verbatim. A named identifier in the question is a constraint: an `L4` question is never answered from an `L3` row, rows that disagree are refused, and a document that merely mentions the product in passing is not used. The returned text is copied from the source, so it verifies by construction and costs no tokens.
 
 Measured on the reference machine (i5-9400, 16 GB, GTX 1660 Super 6 GB, Qwen3-4B on the GPU, embeddings on the CPU), against a 32-passage product document: attribute questions answered in **2–4 s** with one model call, a semantic question ("When was the i5 9400 released?", answered by "Launched on January 7, 2019") in about 12 s, and out-of-scope or false-premise questions abstained rather than answered. Re-ingesting that document dropped from 39 model calls to 16 and indexed 32 passages instead of 39, with no separator fragments.
@@ -166,12 +216,14 @@ Copy `.env.example` and keep the defaults for a local demo. Important variables:
 - `make local-chat*` — install, start, pull, and warm the local Ollama model documented above.
 - `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_PORT` — Docker bootstrap values, read by `docker compose`. Keep `MIGRATION_DATABASE_URL` in sync if you change them.
 - `OPENAI_EMBEDDING_DIMENSIONS` — defaults to `true` and asks OpenAI-compatible embedding endpoints for 1024 dimensions. Disable it only for a provider that rejects the optional parameter; the model must still return exactly `EMBEDDING_DIM` values.
+- `OPENAI_EMBEDDING_INPUT_TYPE` — enable for NVIDIA NIM asymmetric embedders; sends `query` or `passage` with each request. Leave it off for providers that reject the field.
+- `RERANK_API_STYLE` — `cohere` (default, `/rerank`) or `nim` (`/ranking`). `RERANK_PATH` overrides the path for hosted NIM endpoints such as `/reranking`; `RERANK_TIMEOUT_SECONDS` defaults to 60.
 - `INTERNAL_LOW/HIGH_THRESHOLD` and `PUBLIC_LOW/HIGH_THRESHOLD` — abstention bands.
 - `DENSE_EXACT_MAX_CHUNKS` — use exact cosine search when the filtered eligible chunk count is at most this value (default 5,000); above it, use HNSW. Set to `0` to force HNSW.
 - `MAX_CHILDREN_PER_PARENT` — maximum child passages kept from one section (default 2), so a rule and its exception can both be returned.
 - `API_URL`, `DEV_TENANT_SLUG`, `DEV_USER_EMAIL` — read by the Next server.
 
-The index uses 1024 dimensions (migration 006). Changing the embedding provider, model, dimensions, query instruction, sequence limit, or `EMBEDDING_VERSION` changes the index identity. Run `make reindex` after any of those changes; until then dense retrieval is disabled for the workspace and the API reports keyword-only mode. `make reindex` rebuilds the default workspace only; pass another slug to `python -m app.reindex`. `make api`, `make seed`, `make reindex`, and `make test` automatically include the local embedding extra only when `.env` sets `EMBEDDING_PROVIDER=local`; override with `UV_EXTRA=local-embeddings` or `UV_EXTRA=`.
+The index uses 1024 dimensions (migration 006). Changing the embedding provider, model, dimensions, query instruction, sequence limit, `OPENAI_EMBEDDING_INPUT_TYPE`, or `EMBEDDING_VERSION` changes the index identity. Run `make reindex` after any of those changes; until then dense retrieval is disabled for the workspace and the API reports keyword-only mode. `make reindex` rebuilds the default workspace only; pass another slug to `python -m app.reindex`. `make api`, `make seed`, `make reindex`, and `make test` automatically include the local embedding extra only when `.env` sets `EMBEDDING_PROVIDER=local`; override with `UV_EXTRA=local-embeddings` or `UV_EXTRA=`.
 
 ## Verification
 
@@ -213,4 +265,4 @@ Manual checks that matter more than a build:
 3. **Public help centre and channels.** Add a public read surface and one thin channel (widget or Discord) over the same answering contract.
 4. **Evaluation coverage.** The starter synthetic harness needs reviewed real-world golden and adversarial cases, human claim-support assessment, and held-out expansion before tuning thresholds; the current bands are explicit defaults, not calibrated values.
 5. **Semantic dedup and change impact.** Document-hash aliases exist; near-duplicate passage detection, topic discovery, and a richer change-impact pass remain.
-6. **Provider testing.** The OpenAI-compatible client is tested against local Ollama; a hosted-model matrix and more retrieval evaluation remain.
+6. **Provider testing.** The OpenAI-compatible client is tested against local Ollama and a local 9router/NVIDIA NIM embedding path, with mocked NIM rerank HTTP coverage; a broader hosted-model matrix, live NIM rerank runs, and more retrieval evaluation remain.

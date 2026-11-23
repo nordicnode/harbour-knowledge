@@ -61,7 +61,7 @@ export function Topbar({ meta }: { meta: Meta | null }) {
           </Link>
           <Link
             href="/knowledge#add"
-            className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-pine px-3 text-[12px] font-medium text-white transition-colors hover:bg-pine-dark"
+            className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-pine px-3 text-[12px] font-medium text-[#0c1711] transition-colors hover:bg-pine-dark"
           >
             <Plus size={13} />
             Add knowledge

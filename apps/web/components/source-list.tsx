@@ -50,7 +50,7 @@ function SelectionMark({ checked }: { checked: boolean }) {
       aria-hidden="true"
       className={cn(
         "flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors",
-        checked ? "border-pine bg-pine text-white" : "border-line-strong bg-surface text-transparent",
+        checked ? "border-pine bg-pine text-[#0c1711]" : "border-line-strong bg-surface text-transparent",
       )}
     >
       <Check size={11} strokeWidth={3} />
@@ -166,7 +166,7 @@ function SourceListItem({
                 type="button"
                 onClick={remove}
                 disabled={pending}
-                className="inline-flex h-7 items-center gap-1 rounded-md bg-rust px-2 text-[10.5px] font-medium text-white transition-colors hover:bg-rust/90 disabled:cursor-not-allowed disabled:opacity-60"
+                className="inline-flex h-7 items-center gap-1 rounded-md bg-rust px-2 text-[10.5px] font-medium text-[#1a0e0a] transition-colors hover:bg-rust/90 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {pending ? <Loader2 size={11} className="animate-spin" /> : null}
                 {pending ? "Removing…" : "Remove"}
@@ -328,7 +328,7 @@ export function SourceList({
                   type="button"
                   onClick={removeSelected}
                   disabled={pending || !selected.size}
-                  className="inline-flex h-7 items-center gap-1 rounded-md bg-rust px-2.5 text-[10.5px] font-medium text-white transition-colors hover:bg-rust/90 disabled:cursor-not-allowed disabled:opacity-60"
+                  className="inline-flex h-7 items-center gap-1 rounded-md bg-rust px-2.5 text-[10.5px] font-medium text-[#1a0e0a] transition-colors hover:bg-rust/90 disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   {pending ? <Loader2 size={11} className="animate-spin" /> : null}
                   {pending ? "Removing…" : "Remove"}

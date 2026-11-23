@@ -20,3 +20,6 @@ coverage/
 
 # Generated evaluation reports can contain document excerpts and answers.
 services/api/evaluation/baseline-*.json
+
+# Local-only provider run configuration.
+.env.nim

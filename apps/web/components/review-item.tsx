@@ -411,7 +411,7 @@ export function ReviewCard({
                 ) : (
                   <Link
                     href={`/knowledge/new?q=${encodeURIComponent(String(payload.question ?? ""))}`}
-                    className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-pine px-3 text-[12.5px] font-medium text-white hover:bg-pine-dark"
+                    className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-pine px-3 text-[12.5px] font-medium text-[#0c1711] hover:bg-pine-dark"
                   >
                     Draft the answer <ArrowRight size={12} />
                   </Link>
@@ -458,7 +458,7 @@ export function ReviewCard({
                 {answer ? (
                   <Link
                     href={`/knowledge/${answer.id}`}
-                    className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-pine px-3 text-[12.5px] font-medium text-white hover:bg-pine-dark"
+                    className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-pine px-3 text-[12.5px] font-medium text-[#0c1711] hover:bg-pine-dark"
                   >
                     Check the answer <ArrowRight size={12} />
                   </Link>

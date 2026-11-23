@@ -149,7 +149,7 @@ function Table({
 
   if (keyValue) {
     return (
-      <div key={index} className="my-3 overflow-hidden rounded-lg border border-line">
+      <div key={index} className="my-2 overflow-hidden rounded-lg border border-line">
         <table className="w-full border-collapse text-[12.5px]">
           <tbody>
             {rows.map((row, rowIndex) => (
@@ -172,7 +172,7 @@ function Table({
   }
 
   return (
-    <div key={index} className="my-3 overflow-x-auto rounded-lg border border-line">
+    <div key={index} className="my-2 overflow-x-auto rounded-lg border border-line">
       <table className="w-full border-collapse text-[12.5px]">
         {header ? (
           <thead className="bg-surface-2">
@@ -403,10 +403,12 @@ export function AnswerText({
   text,
   citations,
   dense = false,
+  compact = false,
 }: {
   text: string;
   citations?: readonly AnswerCitation[];
   dense?: boolean;
+  compact?: boolean;
 }) {
   const citationNumbers = new Map<string, number>();
   for (const [index, citation] of (citations ?? []).entries()) {
@@ -418,7 +420,9 @@ export function AnswerText({
   const clean = (text ?? "").replace(/<!--[\s\S]*?-->/g, "").trim();
   const className = dense
     ? "prose-answer prose-dense text-[12px] leading-[1.65] text-ink-2"
-    : "prose-answer text-[14px] leading-[1.72] text-ink-2";
+    : compact
+      ? "prose-answer prose-dense text-[13px] leading-[1.62] text-ink-2"
+      : "prose-answer text-[14px] leading-[1.72] text-ink-2";
 
   return <div className={className}>{renderBlocks(clean, "answer", citationNumbers)}</div>;
 }

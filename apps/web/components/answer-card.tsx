@@ -85,16 +85,16 @@ function Feedback({ result }: { result: AskResult }) {
   }
 
   return (
-    <div className="mt-5 border-t border-line/80 pt-3.5">
+    <div className="mt-3 border-t border-line/80 pt-2.5">
       <div className="flex flex-wrap items-center gap-1.5">
-        <span className="mr-1 text-[10.5px] font-medium uppercase tracking-[0.1em] text-faint">Useful?</span>
+        <span className="mr-1 text-[10px] font-medium uppercase tracking-[0.1em] text-faint">Useful?</span>
         <button
           type="button"
           onClick={() => send(1)}
           disabled={pending}
           aria-label="This answer was useful"
           className={cn(
-            "flex h-7 items-center gap-1 rounded-md px-2 text-[11px] transition-colors",
+            "flex h-6 items-center gap-1 rounded-md px-2 text-[10.5px] transition-colors",
             vote === 1 ? "bg-pine-soft text-pine-dark" : "text-muted hover:bg-paper-deep",
           )}
         >
@@ -106,7 +106,7 @@ function Feedback({ result }: { result: AskResult }) {
           disabled={pending}
           aria-label="This answer was not useful"
           className={cn(
-            "flex h-7 items-center gap-1 rounded-md px-2 text-[11px] transition-colors",
+            "flex h-6 items-center gap-1 rounded-md px-2 text-[10.5px] transition-colors",
             vote === -1 ? "bg-rust-soft text-rust" : "text-muted hover:bg-paper-deep",
           )}
         >
@@ -116,7 +116,7 @@ function Feedback({ result }: { result: AskResult }) {
         <button
           type="button"
           onClick={() => setEditing((value) => !value)}
-          className="flex h-7 items-center gap-1 rounded-md px-2 text-[11px] text-muted transition-colors hover:bg-paper-deep"
+          className="flex h-6 items-center gap-1 rounded-md px-2 text-[10.5px] text-muted transition-colors hover:bg-paper-deep"
         >
           <MessageSquareWarning size={12} /> Suggest an edit
         </button>
@@ -167,21 +167,21 @@ export function AnswerCard({ result }: { result: AskResult }) {
   if (result.abstained) {
     return (
       <Card className="overflow-hidden">
-        <div className="border-l-[3px] border-rust px-5 py-5 md:px-6">
+        <div className="border-l-[3px] border-rust px-4 py-4 md:px-5">
           <div className="flex flex-wrap items-center gap-2">
             {modePill("abstained")}
             <Badge tone="neutral">Gap logged</Badge>
           </div>
-          <h3 className="display mt-3 text-[23px] leading-tight text-ink">I could not answer that safely.</h3>
-          <p className="mt-2 max-w-2xl text-[13.5px] leading-relaxed text-ink-2">
+          <h3 className="display mt-2.5 text-[20px] leading-tight text-ink">I could not answer that safely.</h3>
+          <p className="mt-1.5 max-w-2xl text-[12.5px] leading-relaxed text-ink-2">
             {result.abstention_reason ?? "No approved answer covers this question for the selected scope."}
           </p>
           <IndexWarning warning={result.index_warning} />
-          <div className="mt-4 rounded-lg border border-line bg-surface-2 px-4 py-3">
+          <div className="mt-3 rounded-lg border border-line bg-surface-2 px-3 py-2">
             <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-faint">Searched</p>
-            <p className="mt-1 text-[12px] text-ink-2">{result.searched_scope}</p>
+            <p className="mt-0.5 text-[11.5px] text-ink-2">{result.searched_scope}</p>
           </div>
-          <div className="mt-4 flex flex-wrap gap-2">
+          <div className="mt-3 flex flex-wrap gap-2">
             {result.next_steps.map((step) => (
               <span
                 key={step}
@@ -191,7 +191,7 @@ export function AnswerCard({ result }: { result: AskResult }) {
               </span>
             ))}
           </div>
-          <p className="mt-4 text-[11px] text-faint">
+          <p className="mt-3 text-[10px] text-faint">
             This question is now clustered on the gap dashboard. An owner can draft an answer from source.
           </p>
         </div>
@@ -201,8 +201,8 @@ export function AnswerCard({ result }: { result: AskResult }) {
 
   return (
     <Card className="overflow-hidden">
-      <div className="border-l-[3px] border-pine px-5 py-5 md:px-6">
-        <div className="flex flex-wrap items-start justify-between gap-3">
+      <div className="border-l-[3px] border-pine px-4 py-4 md:px-5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex flex-wrap items-center gap-2">
             {modePill(result.mode)}
             <ConfidenceMeter band={result.confidence_band} mode={result.mode} compact />
@@ -214,7 +214,7 @@ export function AnswerCard({ result }: { result: AskResult }) {
               setCopied(true);
               setTimeout(() => setCopied(false), 1800);
             }}
-            className="inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-[11px] text-muted transition-colors hover:bg-paper-deep hover:text-ink"
+            className="inline-flex h-6 items-center gap-1.5 rounded-md px-2 text-[10.5px] text-muted transition-colors hover:bg-paper-deep hover:text-ink"
           >
             {copied ? <Check size={12} /> : <Clipboard size={12} />}
             {copied ? "Copied" : "Copy reply"}
@@ -223,44 +223,45 @@ export function AnswerCard({ result }: { result: AskResult }) {
 
         <IndexWarning warning={result.index_warning} />
 
-        <div className="mt-4">
-          <AnswerText text={result.answer_md ?? ""} citations={result.citations} />
+        <div className="mt-3">
+          <AnswerText text={result.answer_md ?? ""} citations={result.citations} compact />
         </div>
 
         {result.citations.length ? (
-          <div className="mt-5">
-            <div className="mb-2 flex items-center justify-between">
-              <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-faint">
+          <details className="group/evidence mt-3 overflow-hidden rounded-lg border border-line bg-surface-2/60">
+            <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-[10.5px] text-muted">
+              <span className="font-semibold uppercase tracking-[0.12em] text-faint">
                 Evidence · {result.citations.length}
-              </p>
+              </span>
               {unverifiedCitations ? (
-                <span className="flex items-center gap-1 text-[10.5px] text-rust">
+                <span className="ml-auto flex items-center gap-1 text-rust">
                   <ShieldAlert size={12} /> {unverifiedCitations} unverified
                 </span>
               ) : (
-                <span className="flex items-center gap-1 text-[10.5px] text-pine">
+                <span className="ml-auto flex items-center gap-1 text-pine">
                   <ShieldCheck size={12} /> quotes verified
                 </span>
               )}
-            </div>
-            <div className="overflow-hidden rounded-lg border border-line bg-surface-2">
+              <ChevronDown size={13} className="shrink-0 text-faint transition-transform group-open/evidence:rotate-180" />
+            </summary>
+            <div className="border-t border-line/70">
               {result.citations.map((citation, index) => (
                 <details
-                  key={citation.evidence_id}
-                  id={`evidence-${citation.evidence_id}`}
-                  className="group scroll-mt-24 border-b border-line/80 last:border-b-0"
+                  key={`${citation.evidence_id}-${index}`}
+                  id={`evidence-${citation.evidence_id}-${index}`}
+                  className="group/citation scroll-mt-24 border-b border-line/80 last:border-b-0"
                 >
-                  <summary className="flex cursor-pointer list-none items-center gap-2.5 px-3.5 py-2.5 text-[11.5px] hover:bg-surface">
+                  <summary className="flex cursor-pointer list-none items-center gap-2.5 px-3 py-2 text-[11px] hover:bg-surface">
                     <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-[5px] bg-pine-soft font-mono text-[10px] text-pine-dark">
                       {index + 1}
                     </span>
                     <span className="min-w-0 flex-1 truncate font-medium text-ink-2">{citation.source_title}</span>
                     <span className="hidden shrink-0 text-[10.5px] text-faint sm:block">{citation.section_path}</span>
                     {citation.verified ? <ShieldCheck size={12} className="shrink-0 text-pine" /> : <Badge tone="rust">unverified</Badge>}
-                    <ChevronDown size={13} className="shrink-0 text-faint transition-transform group-open:rotate-180" />
+                    <ChevronDown size={13} className="shrink-0 text-faint transition-transform group-open/citation:rotate-180" />
                   </summary>
-                  <div className="border-t border-line/70 bg-surface px-4 py-3">
-                    <div className="border-l-2 border-line pl-3">
+                  <div className="border-t border-line/70 bg-surface px-3 py-2.5">
+                    <div className="border-l-2 border-line pl-2.5">
                       <AnswerText text={citation.quote} dense />
                     </div>
                     <p className="mt-2 text-[10.5px] text-faint">
@@ -271,7 +272,7 @@ export function AnswerCard({ result }: { result: AskResult }) {
                 </details>
               ))}
             </div>
-          </div>
+          </details>
         ) : null}
 
         {result.sources_ignored.length ? (
@@ -298,7 +299,7 @@ export function AnswerCard({ result }: { result: AskResult }) {
 
         <Feedback result={result} />
 
-        <div className="mt-3 flex flex-wrap items-center gap-3 text-[10px] text-faint">
+        <div className="mt-2.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[9.5px] text-faint">
           <span>{result.provider === "dev" ? "Dev intelligence" : result.provider}</span>
           <span>·</span>
           <span>{result.latency_ms} ms</span>

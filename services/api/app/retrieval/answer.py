@@ -17,9 +17,15 @@ from ..deps import Session
 from ..errors import AppError, validation
 from ..intelligence import EvidencePassage, GenerationResult, get_intelligence
 from ..intelligence.dev import match_tokens, term_matches, tokenize
+from ..intelligence.questions import (
+    normalise_subquestions,
+    question_part_count,
+    split_question_parts,
+)
 from ..ingest.pipeline import quote_in_text
 from .search import (
     RetrievedPassage,
+    SearchOutcome,
     band_for,
     confidence_composite,
     has_detectable_contradiction,
@@ -221,6 +227,22 @@ ROW_STOPWORDS = frozenset("""a an the is are was were be been what which who how
     i we you they he she product model number specification specs value please tell
     give show find need want get""".split())
 
+# A narrow attribute mapping for exact table-row lookup. "When was it released?"
+# and "What is the launch date?" ask for the same row; this does not add
+# synonyms for arbitrary prose.
+ATTRIBUTE_SYNONYMS = {
+    "release": "launch",
+    "released": "launch",
+    "releases": "launch",
+    "launch": "launch",
+    "launched": "launch",
+    "launches": "launch",
+    "announced": "launch",
+    "announcement": "launch",
+    "introduced": "launch",
+    "introduction": "launch",
+}
+
 
 def _model_ids(text: str) -> set[str]:
     """Normalised product identifiers such as "i5 9400" or "i7-12700F"."""
@@ -274,7 +296,8 @@ def _table_row_fact(question: str, passages: list[RetrievedPassage]) -> Generati
         if re.search(r"\d", token) and token not in model
     }
     words = {
-        token for token in tokens
+        ATTRIBUTE_SYNONYMS.get(token, token)
+        for token in tokens
         if token not in ROW_STOPWORDS and not re.search(r"\d", token)
     }
     if not words:
@@ -941,6 +964,428 @@ async def _maybe_propose_fallback(
     )
 
 
+def _merge_search_outcomes(outcomes: list[SearchOutcome], limit: int = 8) -> SearchOutcome:
+    """Keep each part's strongest evidence without letting one part fill the prompt."""
+    if not outcomes:
+        return SearchOutcome([], 0, 0.0, dense_index="hybrid", dense_scan="none")
+    per_part = max(2, limit // len(outcomes))
+    ordered: list[RetrievedPassage] = []
+    seen: set[UUID] = set()
+    for outcome in outcomes:
+        for passage in outcome.passages[:per_part]:
+            if passage.passage_id in seen:
+                continue
+            seen.add(passage.passage_id)
+            ordered.append(passage)
+    remaining = sorted(
+        (p for outcome in outcomes for p in outcome.passages if p.passage_id not in seen),
+        key=lambda p: p.rerank_score,
+        reverse=True,
+    )
+    for passage in remaining:
+        if len(ordered) >= limit:
+            break
+        seen.add(passage.passage_id)
+        ordered.append(passage)
+    warnings = [o.index_warning for o in outcomes if o.index_warning]
+    dense_modes = {o.dense_index for o in outcomes}
+    dense_scans = {o.dense_scan for o in outcomes}
+    return SearchOutcome(
+        passages=ordered[:limit],
+        candidates_scanned=sum(o.candidates_scanned for o in outcomes),
+        query_coverage=sum(o.query_coverage for o in outcomes) / len(outcomes),
+        dense_index=outcomes[0].dense_index if len(dense_modes) == 1 else "hybrid",
+        dense_scan=outcomes[0].dense_scan if len(dense_scans) == 1 else "mixed",
+        index_warning="; ".join(dict.fromkeys(warnings)) or None,
+    )
+
+
+def _evidence_passages(passages: list[RetrievedPassage]) -> list[EvidencePassage]:
+    return [
+        EvidencePassage(
+            evidence_id=str(passage.passage_id),
+            text=passage.child_text,
+            title=passage.document_title,
+            section_path=passage.section_path,
+            source_date=_iso(passage.effective_from),
+            source_tier=passage.source_tier,
+            visibility=passage.visibility,
+            plan_scope=passage.plan_scope,
+            version_scope=passage.version_scope,
+            score=passage.rerank_score,
+        )
+        for passage in passages
+    ]
+
+
+def _table_rescue(question: str, passages: list[RetrievedPassage]) -> GenerationResult | None:
+    for extractor in (_table_fact_fallback, _table_row_fact):
+        found = extractor(question, passages)
+        if found:
+            return found
+    return None
+
+
+def _citations_for_answer(
+    answer_md: str,
+    passages: list[RetrievedPassage],
+    question: str,
+) -> list[Citation]:
+    asked_models = _model_ids(question)
+    citations: list[Citation] = []
+    seen: set[str] = set()
+    for passage in passages:
+        passage_id = str(passage.passage_id)
+        if passage_id in seen:
+            continue
+        seen.add(passage_id)
+        quote = _supporting_quote(answer_md, passage.child_text)
+        if quote and asked_models:
+            quote_models = _model_ids(quote)
+            if quote_models and not (quote_models & asked_models):
+                continue
+        # A cited passage with no excerpt that supports the claim is not
+        # evidence for it. Showing a truncated, unrelated paragraph as a
+        # citation made the answer look verified when it was not.
+        if not quote:
+            continue
+        excerpt = quote
+        if not excerpt:
+            continue
+        citations.append(
+            Citation(
+                evidence_id=passage_id,
+                passage_id=passage_id,
+                quote=excerpt,
+                source_title=passage.source_title,
+                source_date=_iso(passage.effective_from),
+                section_path=passage.section_path,
+                verified=bool(quote and quote_in_text(quote, passage.child_text)),
+            )
+        )
+    return citations
+
+
+async def _abstain_multi(
+    conn: AsyncConnection,
+    session: Session,
+    request: AskRequest,
+    questions: list[str],
+    reason: str,
+    audience: str,
+    plan: str | None,
+    product_version: str | None,
+    started: float,
+    merged: SearchOutcome | None = None,
+    sources_ignored: list[dict] | None = None,
+) -> dict:
+    intelligence = get_intelligence()
+    gap_ids = [await _upsert_gap(conn, session, question, request.channel) for question in questions]
+    gap_id = gap_ids[0] if gap_ids else None
+    retrieved_ids = [p.passage_id for p in merged.passages] if merged else []
+    scores = [p.rerank_score for p in merged.passages] if merged else []
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    qa_log_id = await _log_qa(
+        conn, session, request, " ".join(questions), "abstained", None, [],
+        sources_ignored or [], retrieved_ids, scores, None, None, True, gap_id,
+        None, None, latency_ms, intelligence.name,
+    )
+    next_steps = (
+        ["Ask a teammate in your support channel.", "Draft a canonical answer from the sources below."]
+        if audience == "internal"
+        else ["Contact support for a human answer."]
+    )
+    return {
+        "question": request.question,
+        "standalone_query": " ".join(questions),
+        "channel": request.channel,
+        "mode": "abstained",
+        "answer_md": None,
+        "citations": [],
+        "confidence_band": "low",
+        "confidence": None,
+        "sources_ignored": sources_ignored or [],
+        "conflict_notice": None,
+        "abstained": True,
+        "abstention_reason": reason,
+        "searched_scope": await _searched_scope(conn, session, audience, plan, product_version),
+        "next_steps": next_steps,
+        "gap_id": str(gap_id) if gap_id else None,
+        "answer_id": None,
+        "answer_version": None,
+        "qa_log_id": str(qa_log_id),
+        "latency_ms": latency_ms,
+        "provider": intelligence.name,
+        "retrieval_mode": merged.dense_index if merged else "hybrid",
+        "dense_scan": merged.dense_scan if merged else "none",
+        "index_warning": merged.index_warning if merged else None,
+    }
+
+
+async def _ask_multi_part(
+    conn: AsyncConnection,
+    session: Session,
+    settings: Settings,
+    request: AskRequest,
+    parts: list[str],
+    plan: str | None,
+    product_version: str | None,
+    audience: str,
+    started: float,
+) -> dict:
+    intelligence = get_intelligence()
+    if audience == "public":
+        # A customer-facing answer needs one approved, public answer covering the
+        # whole request. Joining independent fallback drafts would expose
+        # unapproved source text and make a partial answer look complete.
+        return await _abstain_multi(
+            conn, session, request, parts,
+            "No approved public answer covers every part of this question.",
+            audience, plan, product_version, started,
+        )
+
+    low = settings.internal_low_threshold
+    # Embed every part in one request. Remote embedding providers charge a round
+    # trip per call, and a compound question otherwise paid it once per part.
+    embeddings = await intelligence.embed(list(parts), task="query")
+    if len(embeddings) != len(parts):
+        embeddings = [(await intelligence.embed([part], task="query"))[0] for part in parts]
+
+    outcomes: list[SearchOutcome] = []
+    strengths: list[float] = []
+    for part, embedding in zip(parts, embeddings):
+        outcome = await hybrid_search(
+            conn,
+            part,
+            embedding,
+            channel=audience,
+            plan=plan,
+            product_version=product_version,
+            as_of=request.as_of,
+        )
+        outcomes.append(outcome)
+        strengths.append(retrieval_strength(outcome))
+
+    attempted = [
+        index for index, strength in enumerate(strengths)
+        if outcomes[index].passages and strength >= low
+    ]
+    missing = [index for index in range(len(parts)) if index not in attempted]
+    if not attempted:
+        return await _abstain_multi(
+            conn, session, request, parts,
+            "No part of this question could be grounded in the current evidence.",
+            audience, plan, product_version, started, _merge_search_outcomes(outcomes),
+        )
+
+    merged = _merge_search_outcomes([outcomes[index] for index in attempted])
+    if not merged.passages:
+        return await _abstain_multi(
+            conn, session, request, parts,
+            "No part of this question could be grounded in the current evidence.",
+            audience, plan, product_version, started, merged,
+        )
+
+    evidence = _evidence_passages(merged.passages)
+    questions = [parts[index] for index in attempted]
+    generator = getattr(intelligence, "generate_multi_answer", None)
+    if callable(generator):
+        generated = list((await generator(questions, evidence, None)).answers)
+    else:
+        generated = [
+            await intelligence.generate_answer(question, evidence, None)
+            for question in questions
+        ]
+    generated += [GenerationResult("", [], True)] * (len(questions) - len(generated))
+
+    by_id = {str(passage.passage_id): passage for passage in merged.passages}
+    resolved: dict[int, dict] = {}
+
+    def resolve_generation(part_index: int, generation: GenerationResult) -> dict | None:
+        """Validate one generated part and fall back to a deterministic row."""
+        answer_md = (generation.answer_md or "").strip()
+        cited_ids = list(dict.fromkeys(
+            cid for cid in (generation.cited_ids or []) if cid in by_id
+        ))
+        cited_passages = [by_id[cid] for cid in cited_ids]
+        if generation.abstain or not answer_md or not cited_passages:
+            rescue = _table_rescue(parts[part_index], merged.passages)
+            if rescue:
+                answer_md = (rescue.answer_md or "").strip()
+                cited_ids = list(dict.fromkeys(
+                    cid for cid in (rescue.cited_ids or []) if cid in by_id
+                ))
+                cited_passages = [by_id[cid] for cid in cited_ids]
+        if not answer_md or not cited_passages:
+            return None
+        faithfulness = lexical_faithfulness(answer_md, cited_passages, merged.passages)
+        if faithfulness < 1.0:
+            rescue = _table_rescue(parts[part_index], merged.passages)
+            if rescue:
+                answer_md = (rescue.answer_md or "").strip()
+                cited_ids = list(dict.fromkeys(
+                    cid for cid in (rescue.cited_ids or []) if cid in by_id
+                ))
+                cited_passages = [by_id[cid] for cid in cited_ids]
+                faithfulness = lexical_faithfulness(answer_md, cited_passages, merged.passages)
+        if faithfulness < 1.0:
+            return None
+        citations = _citations_for_answer(answer_md, cited_passages, parts[part_index])
+        if not citations:
+            return None
+        return {
+            "answer_md": answer_md,
+            "citations": citations,
+            "faithfulness": faithfulness,
+        }
+
+    for offset, part_index in enumerate(attempted):
+        result = resolve_generation(part_index, generated[offset])
+        if result:
+            resolved[part_index] = result
+
+    # A combined generation can leave one part unanswered even after its retry.
+    # Ask that part on its own before reporting it as missing; the single-part
+    # prompt no longer has to share attention with every other question.
+    individual = getattr(intelligence, "generate_answer", None)
+    if callable(individual):
+        for part_index in attempted:
+            if part_index in resolved:
+                continue
+            try:
+                generation = await individual(parts[part_index], evidence, None)
+            except AppError as exc:
+                # A failed individual retry must not discard the parts that did
+                # resolve; report this part as missing instead.
+                log.warning("individual compound part failed: %s", exc)
+                continue
+            result = resolve_generation(part_index, generation)
+            if result:
+                resolved[part_index] = result
+
+    missing = sorted(index for index in range(len(parts)) if index not in resolved)
+    if not resolved:
+        return await _abstain_multi(
+            conn, session, request, parts,
+            "No part of this question could be grounded in the retrieved evidence.",
+            audience, plan, product_version, started, merged,
+        )
+
+    cited_ids_all = [
+        UUID(citation.passage_id)
+        for result in resolved.values()
+        for citation in result["citations"]
+    ]
+    cited_conflicts = await _pending_conflicts(conn, cited_ids_all, audience)
+    if cited_conflicts:
+        ignored = _conflict_sources_ignored(
+            cited_conflicts, {str(passage_id) for passage_id in cited_ids_all}
+        )
+        return await _abstain_multi(
+            conn, session, request, parts,
+            "Cited sources have an unresolved conflict and need review.",
+            audience, plan, product_version, started, merged, ignored,
+        )
+
+    historical = await _historical_accuracy(conn, None)
+    retrieval = min(strengths[index] for index in resolved)
+    faithfulness = min(result["faithfulness"] for result in resolved.values())
+    composite = min(
+        confidence_composite(strengths[index], result["faithfulness"], historical)
+        for index, result in resolved.items()
+    )
+    if composite < low:
+        return await _abstain_multi(
+            conn, session, request, parts,
+            "Confidence stayed below the abstention threshold.",
+            audience, plan, product_version, started, merged,
+        )
+    band = band_for(composite, audience, settings)
+    if missing:
+        band = "medium" if band == "high" else band
+
+    global_citations: list[dict] = []
+    sections: list[str] = []
+    for index, part in enumerate(parts):
+        if index not in resolved:
+            sections.append(
+                f"**{part}**\n\nI couldn't find current evidence to answer this part."
+            )
+            continue
+        result = resolved[index]
+        markers: dict[str, int] = {}
+        for citation in result["citations"]:
+            if citation.passage_id in markers:
+                continue
+            global_citations.append(citation.as_dict())
+            markers[citation.passage_id] = len(global_citations)
+        part_answer = re.sub(
+            r"\[P:([^\]]+)\]",
+            lambda match: f"[{markers[match.group(1)]}]"
+            if match.group(1) in markers else "",
+            result["answer_md"],
+        )
+        sections.append(f"**{part}**\n\n{part_answer}")
+
+    label = (
+        "> **Draft from unapproved sources.** This is not yet a canonical answer. "
+        "Check the citations before sending it to a customer. "
+        "Time-sensitive facts may be out of date."
+    )
+    if missing:
+        label += (
+            "\n>\n> **Incomplete.** At least one part had no verifiable evidence. "
+            "The missing part is marked below."
+        )
+    if band == "medium":
+        label += (
+            "\n>\n> **Review recommended.** The retrieved evidence only partly covers this request."
+        )
+    answer_md = f"{label}\n\n" + "\n\n".join(sections)
+
+    gap_ids = [
+        await _upsert_gap(conn, session, parts[index], request.channel)
+        for index in missing
+    ]
+    gap_id = gap_ids[0] if gap_ids else None
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    qa_log_id = await _log_qa(
+        conn, session, request, " ".join(parts), "fallback", answer_md, global_citations,
+        [], [p.passage_id for p in merged.passages],
+        [p.rerank_score for p in merged.passages], composite, band, False, gap_id,
+        None, None, latency_ms, intelligence.name,
+    )
+    return {
+        "question": request.question,
+        "standalone_query": " ".join(parts),
+        "channel": request.channel,
+        "mode": "fallback",
+        "answer_md": answer_md,
+        "citations": global_citations,
+        "confidence_band": band,
+        "confidence": {
+            "composite": round(composite, 3),
+            "retrieval": round(retrieval, 3),
+            "faithfulness": round(faithfulness, 3),
+            "historical": round(historical, 3),
+        },
+        "sources_ignored": [],
+        "conflict_notice": None,
+        "abstained": False,
+        "searched_scope": await _searched_scope(conn, session, audience, plan, product_version),
+        "next_steps": [],
+        "gap_id": str(gap_id) if gap_id else None,
+        "answer_id": None,
+        "answer_version": None,
+        "qa_log_id": str(qa_log_id),
+        "latency_ms": latency_ms,
+        "provider": intelligence.name,
+        "retrieval_mode": merged.dense_index,
+        "dense_scan": merged.dense_scan,
+        "index_warning": merged.index_warning,
+    }
+
+
 async def ask(conn: AsyncConnection, session: Session, settings: Settings, request: AskRequest) -> dict:
     if not request.question.strip():
         raise validation("A question is required.")
@@ -956,6 +1401,22 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
     standalone = rewrite.standalone_question.strip() or request.question.strip()
     plan = request.plan or rewrite.plan
     product_version = request.product_version or rewrite.product_version
+
+    parts = normalise_subquestions(getattr(rewrite, "sub_questions", None))
+    if not parts:
+        parts = [standalone]
+    if len(parts) == 1 and question_part_count(request.question) > 1:
+        # The provider ignored the decomposition instruction. Split only the
+        # explicit separators; a collapsed one-part rewrite cannot be recovered
+        # here, which is why the rewrite itself retries before this point.
+        fallback_parts = split_question_parts(standalone or request.question)
+        if len(fallback_parts) > 1:
+            parts = fallback_parts
+    if len(parts) > 1:
+        return await _ask_multi_part(
+            conn, session, settings, request, parts, plan, product_version, audience, started
+        )
+    standalone = parts[0] if parts else standalone
 
     embedding = (await intelligence.embed([standalone], task="query"))[0]
     outcome = await hybrid_search(

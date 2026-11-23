@@ -579,13 +579,58 @@ def _markup_normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _short_table_value_supported(claim: str, sentence: str) -> bool:
+    """Accept a compact field/value answer against one cited table row.
+
+    A model often answers "6 cores" or "Launched on January 7, 2019" instead
+    of reciting the whole row. Requiring every meaningful claim token and every
+    claim number to occur in the same row keeps the field/value association; a
+    bare digit still cannot match an unrelated row. This deliberately applies
+    only to table rows, so a prose claim that drops a condition is still
+    rejected by the stricter sentence rules.
+    """
+    row = sentence.strip()
+    if not (row.startswith("|") and row.endswith("|")):
+        return False
+    def clean(token: str) -> str:
+        return token.rstrip(".,;:!?)]")
+
+    claim_tokens = [cleaned for token in _markup_normalize(claim).split() if (cleaned := clean(token))]
+    if not (0 < len(claim_tokens) <= 12):
+        return False
+    row_tokens = [cleaned for token in _markup_normalize(row).split() if (cleaned := clean(token))]
+    ignorable = {
+        "a", "an", "the", "it", "its", "is", "are", "was", "were", "be",
+        "been", "has", "have", "had", "does", "do", "did", "this", "that",
+        "these", "those", "of", "for", "on", "in", "to", "with", "and", "or",
+        "also", "approximately", "about",
+    }
+    claim_numbers = {token for token in claim_tokens if token[0].isdigit()}
+    row_numbers = {token for token in row_tokens if token[0].isdigit()}
+    claim_words = {
+        token for token in claim_tokens
+        if not token[0].isdigit() and token not in ignorable
+    }
+    row_words = {token for token in row_tokens if not token[0].isdigit()}
+    return bool(
+        claim_numbers
+        and claim_numbers == row_numbers
+        and claim_words
+        and all(term_overlap({word}, row_words) for word in claim_words)
+    )
+
+
 def claim_supported_by_sentence(claim: str, sentence: str) -> bool:
     """Decide whether one claim is supported by one cited sentence.
 
-    Three standards are accepted:
+    Four standards are accepted:
 
     * **Verbatim** - the claim equals the sentence after normalisation. This is
       the strict path and proves the words were copied.
+    * **Short table value** - a compact field/value answer matches one cited
+      table row, with every meaningful token and number present in that row.
+      This covers "6 cores" and "Launched on January 7, 2019" without letting a
+      bare digit match an unrelated row.
     * **Near-extractive** - the claim keeps nearly every content word of the
       sentence and introduces almost none of its own, with identical numbers,
       units and negation polarity. This tolerates dropped trailing punctuation,
@@ -601,6 +646,8 @@ def claim_supported_by_sentence(claim: str, sentence: str) -> bool:
     most often gets mistaken for support.
     """
     if _grounding_normalize(claim) == _grounding_normalize(sentence):
+        return True
+    if _short_table_value_supported(claim, sentence):
         return True
 
     claim_content, claim_numbers, claim_negative = _contradiction_signature(claim)

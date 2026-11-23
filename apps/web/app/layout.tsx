@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 
 import "./globals.css";
 import { Sidebar } from "@/components/sidebar";
@@ -9,6 +9,11 @@ import type { Meta } from "@/lib/types";
 export const metadata: Metadata = {
   title: "Harbour Knowledge",
   description: "A governed support knowledge base.",
+};
+
+export const viewport: Viewport = {
+  colorScheme: "dark",
+  themeColor: "#0f130f",
 };
 
 // Every workspace surface reads live governance state; none of it is static.

@@ -95,7 +95,7 @@ export function AnswerComposer({
           <div className="divide-y divide-line/70">
             {chosen.map((hit, index) => (
               <div key={hit.passage_id} className="flex items-start gap-2.5 px-4 py-2.5">
-                <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-pine text-[9.5px] font-semibold text-white">
+                <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-pine text-[9.5px] font-semibold text-[#0c1711]">
                   {index + 1}
                 </span>
                 <div className="min-w-0 flex-1">
@@ -138,7 +138,7 @@ export function AnswerComposer({
                   <span
                     className={cn(
                       "mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border",
-                      active ? "border-pine bg-pine text-white" : "border-line-strong bg-surface",
+                      active ? "border-pine bg-pine text-[#0c1711]" : "border-line-strong bg-surface",
                     )}
                   >
                     {active ? <Check size={11} /> : null}

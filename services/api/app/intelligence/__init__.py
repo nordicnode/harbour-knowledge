@@ -10,6 +10,7 @@ from .base import (
     EvidenceQuote,
     GenerationResult,
     Intelligence,
+    MultiGenerationResult,
     RewriteResult,
     TopicOption,
 )
@@ -53,6 +54,7 @@ __all__ = [
     "EvidenceQuote",
     "GenerationResult",
     "Intelligence",
+    "MultiGenerationResult",
     "RewriteResult",
     "TopicOption",
     "get_intelligence",

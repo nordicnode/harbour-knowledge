@@ -35,7 +35,7 @@ export function GapActions({ gap, approvedAnswers }: { gap: Gap; approvedAnswers
         <div className="flex flex-wrap items-center justify-end gap-2">
           <Link
             href={`/knowledge/new?q=${encodeURIComponent(gap.representative_question)}`}
-            className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-pine px-3 text-[11.5px] font-medium text-white hover:bg-pine-dark"
+            className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-pine px-3 text-[11.5px] font-medium text-[#0c1711] hover:bg-pine-dark"
           >
             <PenLine size={12} /> Answer this
           </Link>

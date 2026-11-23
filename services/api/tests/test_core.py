@@ -9,7 +9,11 @@ from app.config import EMBEDDING_PIPELINE_REVISION, Settings
 from app.errors import AppError
 from app.intelligence.base import EvidencePassage, GenerationResult, RewriteResult
 from app.intelligence.dev import DevIntelligence, match_tokens
-from app.intelligence.openai_compat import OpenAICompatIntelligence
+from app.intelligence.openai_compat import (
+    OpenAICompatIntelligence,
+    _rerank_payload,
+    _rerank_scores,
+)
 from app.intelligence.local_embeddings import (
     EmbeddingInputTooLong,
     LocalEmbeddingIntelligence,
@@ -730,6 +734,175 @@ async def test_upload_reader_accepts_a_file_within_the_limit() -> None:
     assert await _read_upload(upload, 100) == b"hello world"
 
 
+def test_nim_rerank_uses_ranking_shape_and_normalises_logits() -> None:
+    payload = _rerank_payload(
+        "nim", "nvidia/nemotron-3.5-rerank-8b", "which plan?", ["Team", "Annual"]
+    )
+    assert payload == {
+        "model": "nvidia/nemotron-3.5-rerank-8b",
+        "query": {"text": "which plan?"},
+        "passages": [{"text": "Team"}, {"text": "Annual"}],
+        "truncate": "END",
+    }
+    scores = _rerank_scores(
+        "nim",
+        {"rankings": [{"index": 0, "logit": 0.0}, {"index": 1, "logit": 2.0}]},
+        2,
+    )
+    assert scores[0] == pytest.approx(0.5)
+    assert scores[1] == pytest.approx(0.880797, rel=1e-5)
+    # A missing index remains zero rather than shifting another passage's score.
+    sparse = _rerank_scores("nim", {"rankings": [{"index": 1, "logit": 1.0}]}, 2)
+    assert sparse[0] == 0.0 and sparse[1] == pytest.approx(0.731059, rel=1e-5)
+
+
+async def test_nim_rerank_posts_to_the_configured_ranking_path() -> None:
+    import json
+
+    import httpx
+
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"rankings": [{"index": 0, "logit": 0.0}, {"index": 1, "logit": 2.0}]},
+        )
+
+    provider = object.__new__(OpenAICompatIntelligence)
+    provider.settings = SimpleNamespace(
+        model_rerank="nvidia/nemotron-3.5-rerank-8b",
+        rerank_base_url="https://ai.api.nvidia.com/v1/retrieval/nvidia/nemotron-3.5-rerank-8b",
+        rerank_api_key="test-key",
+        rerank_api_style="nim",
+        rerank_endpoint_path="/reranking",
+    )
+    provider._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider._lexical = DevIntelligence()
+    scores = await provider.rerank("which plan?", ["Team", "Annual"])
+    await provider._http.aclose()
+
+    assert captured["url"] == (
+        "https://ai.api.nvidia.com/v1/retrieval/nvidia/nemotron-3.5-rerank-8b/reranking"
+    )
+    assert captured["payload"] == {
+        "model": "nvidia/nemotron-3.5-rerank-8b",
+        "query": {"text": "which plan?"},
+        "passages": [{"text": "Team"}, {"text": "Annual"}],
+        "truncate": "END",
+    }
+    assert scores[0] == pytest.approx(0.5)
+    assert scores[1] == pytest.approx(0.880797, rel=1e-5)
+
+
+def test_cohere_rerank_shape_and_invalid_nim_response() -> None:
+    payload = _rerank_payload("cohere", "rerank-model", "q", ["a", "b"])
+    assert payload["documents"] == ["a", "b"]
+    assert payload["top_n"] == 2
+    scores = _rerank_scores(
+        "cohere",
+        {"results": [{"index": 1, "relevance_score": 0.25}, {"index": 0, "score": 0.75}]},
+        2,
+    )
+    assert scores == [0.75, 0.25]
+    with pytest.raises(ValueError):
+        _rerank_scores("nim", {"rankings": []}, 2)
+    with pytest.raises(ValueError):
+        _rerank_scores("nim", {"rankings": [{"index": 9, "logit": 1.0}]}, 2)
+    with pytest.raises(ValueError):
+        _rerank_scores("cohere", [], 2)
+
+
+def test_embedding_endpoint_can_differ_from_chat() -> None:
+    provider = OpenAICompatIntelligence(
+        Settings(
+            ai_mode="openai",
+            embedding_provider="openai",
+            model_embed="embed-model",
+            openai_base_url="http://127.0.0.1:11434/v1",
+            openai_embedding_base_url="http://127.0.0.1:20128/v1",
+            openai_api_key="chat-key",
+            openai_embedding_api_key="embed-key",
+        )
+    )
+    assert str(provider.client.base_url).rstrip("/") == "http://127.0.0.1:11434/v1"
+    assert str(provider.embedding_client.base_url).rstrip("/") == "http://127.0.0.1:20128/v1"
+
+    # An empty override keeps the single-provider default.
+    same = OpenAICompatIntelligence(
+        Settings(
+            ai_mode="openai",
+            embedding_provider="openai",
+            model_embed="embed-model",
+            openai_base_url="http://127.0.0.1:11434/v1",
+            openai_api_key="chat-key",
+        )
+    )
+    assert str(same.embedding_client.base_url).rstrip("/") == "http://127.0.0.1:11434/v1"
+
+
+def test_chat_can_disable_nim_thinking() -> None:
+    provider = object.__new__(OpenAICompatIntelligence)
+    provider.settings = SimpleNamespace(openai_disable_thinking=True)
+    assert provider._chat_extra() == {
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}
+    }
+    provider.settings.openai_disable_thinking = False
+    assert provider._chat_extra() == {}
+
+
+def test_rerank_path_defaults_and_override() -> None:
+    assert Settings(
+        embedding_provider="openai", model_embed="m", rerank_api_style="nim"
+    ).rerank_endpoint_path == "/ranking"
+    assert Settings(
+        embedding_provider="openai", model_embed="m", rerank_api_style="cohere"
+    ).rerank_endpoint_path == "/rerank"
+    assert Settings(
+        embedding_provider="openai", model_embed="m", rerank_path="reranking"
+    ).rerank_endpoint_path == "/reranking"
+
+
+async def test_openai_embedding_sends_input_type_and_validates_count() -> None:
+    provider = object.__new__(OpenAICompatIntelligence)
+    provider.settings = SimpleNamespace(
+        model_embed="nvidia/nvidia/nemotron-3.5-embed-8b",
+        openai_embedding_dimensions=True,
+        openai_embedding_input_type=True,
+        embedding_dim=1024,
+    )
+    provider.embedding_client = SimpleNamespace(
+        embeddings=SimpleNamespace(
+            create=AsyncMock(return_value=SimpleNamespace(data=[
+                SimpleNamespace(embedding=[0.0] * 1024),
+            ]))
+        )
+    )
+    vectors = await provider.embed(["How old is Mikey?"], task="query")
+    assert len(vectors) == 1
+    kwargs = provider.embedding_client.embeddings.create.await_args.kwargs
+    assert kwargs["extra_body"] == {"input_type": "query"}
+    assert kwargs["dimensions"] == 1024
+    await provider.embed(["Mikey is 40 years old."])
+    assert provider.embedding_client.embeddings.create.await_args.kwargs["extra_body"] == {
+        "input_type": "passage"
+    }
+
+    # OpenAI and other providers that reject the field must not receive it.
+    provider.settings.openai_embedding_input_type = False
+    await provider.embed(["plain question"], task="query")
+    assert "extra_body" not in provider.embedding_client.embeddings.create.await_args.kwargs
+
+    provider.embedding_client.embeddings.create.return_value = SimpleNamespace(
+        data=[SimpleNamespace(embedding=[0.0] * 1024)]
+    )
+    with pytest.raises(AppError) as caught:
+        await provider.embed(["one", "two"], task="document")
+    assert caught.value.code == "provider_rejected"
+
+
 def test_embedding_identity_is_stable_and_config_sensitive() -> None:
     def settings(**overrides) -> Settings:
         values = {
@@ -747,6 +920,9 @@ def test_embedding_identity_is_stable_and_config_sensitive() -> None:
     assert base.embedding_identity != settings(embedding_version="2").embedding_identity
     assert base.embedding_identity != settings(embedding_model="another-model").embedding_identity
     assert base.embedding_identity != settings(embedding_provider="openai", model_embed="text-embedding-3-small").embedding_identity
+    assert settings(embedding_provider="openai", model_embed="m").embedding_identity != settings(
+        embedding_provider="openai", model_embed="m", openai_embedding_input_type=True
+    ).embedding_identity
 
     # The query instruction changes the query vector space for local models.
     first = settings(embedding_provider="local", local_embedding_model="model-a", local_embedding_query_instruction="retrieve a")
@@ -905,6 +1081,43 @@ def test_standalone_questions_skip_the_rewrite_model_call() -> None:
     assert provider._needs_model_rewrite("and the annual one?", None)
     assert provider._needs_model_rewrite("How much is it?", None)
     assert provider._needs_model_rewrite("What is the refund window?", [{"role": "user", "content": "Hi"}])
+
+
+def test_follow_up_rewrite_uses_history_and_rejects_a_product_as_version() -> None:
+    import asyncio
+
+    from app.intelligence.openai_compat import OpenAICompatIntelligence
+
+    provider = object.__new__(OpenAICompatIntelligence)
+    provider.settings = SimpleNamespace(embedding_dim=1024, embedding_model="dev-hashed-v1")
+    provider._lexical = DevIntelligence()
+    provider._chat_json = AsyncMock(
+        return_value={
+            "standalone_question": "How many cores does the i5 9400 have?",
+            "intent": "factoid",
+            "plan": "",
+            # The 30B model used to put the resolved product here. A scope filter
+            # made from that value silently excludes scoped documents.
+            "product_version": "i5 9400",
+            "error_codes": [],
+            "entities": ["i5 9400"],
+        }
+    )
+
+    history = [
+        {"role": "user", "content": "When was the i5 9400 released?"},
+        {"role": "assistant", "content": "Launched on January 7, 2019."},
+    ]
+    result = asyncio.run(provider.rewrite("How many cores does it have?", history))
+
+    assert result.standalone_question == "How many cores does the i5 9400 have?"
+    assert result.product_version is None
+    prompt = provider._chat_json.await_args.args[4]
+    assert "When was the i5 9400 released?" in prompt
+    assert "How many cores does it have?" in prompt
+
+    provider._chat_json.return_value["product_version"] = "v2"
+    assert asyncio.run(provider.rewrite("What about v2?", history)).product_version == "v2"
 
 
 def test_scope_values_are_compared_case_insensitively() -> None:

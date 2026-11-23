@@ -1,25 +1,25 @@
 @import "tailwindcss";
 
 @theme inline {
-  --color-paper: #f4f1e9;
-  --color-paper-deep: #ebe6da;
-  --color-surface: #fffdf8;
-  --color-surface-2: #f9f6ef;
-  --color-ink: #171a16;
-  --color-ink-2: #363c34;
-  --color-muted: #71786c;
-  --color-faint: #9aa093;
-  --color-line: #ded8ca;
-  --color-line-strong: #c8c1b0;
-  --color-pine: #1d5b49;
-  --color-pine-dark: #123d31;
-  --color-pine-soft: #e4efe8;
-  --color-amber: #9a5d16;
-  --color-amber-soft: #f7ecd9;
-  --color-rust: #9e3829;
-  --color-rust-soft: #f6e4dd;
-  --color-sky: #2c5d83;
-  --color-sky-soft: #e5eef5;
+  --color-paper: #0f130f;
+  --color-paper-deep: #171c16;
+  --color-surface: #191f18;
+  --color-surface-2: #20261e;
+  --color-ink: #f2eee3;
+  --color-ink-2: #cbd0c3;
+  --color-muted: #9aa293;
+  --color-faint: #747d6f;
+  --color-line: #2b322a;
+  --color-line-strong: #3d463b;
+  --color-pine: #56a383;
+  --color-pine-dark: #7bc9a8;
+  --color-pine-soft: #1d352b;
+  --color-amber: #d9a95d;
+  --color-amber-soft: #332714;
+  --color-rust: #d97c68;
+  --color-rust-soft: #351d18;
+  --color-sky: #7fb6db;
+  --color-sky-soft: #1a2a35;
   --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -34,20 +34,22 @@
   html {
     background: var(--color-paper);
     color: var(--color-ink);
+    color-scheme: dark;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
   }
 
   body {
     min-height: 100vh;
+    background: var(--color-paper);
     font-family: var(--font-sans);
     font-size: 14.5px;
     line-height: 1.55;
   }
 
   ::selection {
-    background: #cfe0d5;
-    color: var(--color-ink);
+    background: #2d5a47;
+    color: #f2eee3;
   }
 
   a {
@@ -102,7 +104,7 @@ a:focus-visible {
   height: 8px;
 }
 .scrollbar-thin::-webkit-scrollbar-thumb {
-  background: #cdc6b6;
+  background: #3a453a;
   border-radius: 99px;
 }
 

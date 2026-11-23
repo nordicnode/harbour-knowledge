@@ -27,13 +27,21 @@ export async function askAction(input: {
   history?: { role: string; content: string }[];
 }): Promise<ActionResult<AskResult>> {
   try {
-    const result = await apiJson<AskResult>("/v1/ask", "POST", {
-      question: input.question,
-      channel: input.channel,
-      plan: input.plan || null,
-      product_version: input.version || null,
-      history: input.history ?? [],
-    });
+    // A compound question retrieves and generates once per part, and a remote
+    // provider can be cold. The default 45 s budget aborted an answer that was
+    // still in progress and surfaced it as "API not reachable".
+    const result = await apiJson<AskResult>(
+      "/v1/ask",
+      "POST",
+      {
+        question: input.question,
+        channel: input.channel,
+        plan: input.plan || null,
+        product_version: input.version || null,
+        history: input.history ?? [],
+      },
+      120_000,
+    );
     return { ok: true, data: result };
   } catch (error) {
     return toError(error);

@@ -349,7 +349,7 @@ export function ReviewQueue({
           <div
             role="status"
             aria-live="polite"
-            className="pointer-events-auto w-full max-w-[430px] overflow-hidden rounded-[14px] border border-white/10 bg-ink text-white shadow-[0_18px_50px_rgba(23,26,22,0.30)]"
+            className="pointer-events-auto w-full max-w-[430px] overflow-hidden rounded-[14px] border border-white/10 bg-[#0b100c] text-white shadow-[0_18px_50px_rgba(0,0,0,0.55)]"
           >
             <div className="flex items-center gap-3 px-4 py-3">
               <span

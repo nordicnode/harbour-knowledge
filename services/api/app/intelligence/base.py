@@ -33,6 +33,9 @@ class RewriteResult:
     product_version: str | None = None
     error_codes: list[str] = field(default_factory=list)
     entities: list[str] = field(default_factory=list)
+    # One entry per independent request. A single question still has one entry;
+    # consumers must not infer that an empty list means "the same question".
+    sub_questions: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -63,6 +66,13 @@ class GenerationResult:
     answer_md: str
     cited_ids: list[str]
     abstain: bool = False
+
+
+@dataclass
+class MultiGenerationResult:
+    """One answer per requested part, in request order."""
+
+    answers: list[GenerationResult] = field(default_factory=list)
 
 
 class Intelligence(Protocol):
@@ -110,3 +120,10 @@ class Intelligence(Protocol):
         evidence: Sequence[EvidencePassage],
         conflict_notice: str | None = None,
     ) -> GenerationResult: ...
+
+    async def generate_multi_answer(
+        self,
+        questions: Sequence[str],
+        evidence: Sequence[EvidencePassage],
+        conflict_notice: str | None = None,
+    ) -> MultiGenerationResult: ...

@@ -9,11 +9,11 @@ type Size = "sm" | "md" | "lg";
 
 const variants: Record<Variant, string> = {
   primary:
-    "bg-pine text-white shadow-[0_1px_0_rgba(0,0,0,0.18)] hover:bg-pine-dark disabled:bg-pine/50",
+    "bg-pine text-[#0c1711] shadow-[0_1px_0_rgba(0,0,0,0.18)] hover:bg-pine-dark disabled:bg-pine/50 disabled:text-ink-2",
   secondary:
     "border border-line bg-surface text-ink hover:border-line-strong hover:bg-surface-2 disabled:opacity-50",
   ghost: "text-ink-2 hover:bg-paper-deep disabled:opacity-50",
-  danger: "bg-rust text-white hover:bg-rust/90 disabled:opacity-50",
+  danger: "bg-rust text-[#1a0e0a] hover:bg-rust/90 disabled:opacity-50",
   quiet: "border border-line/70 bg-transparent text-ink-2 hover:bg-paper-deep",
 };
 
@@ -78,7 +78,7 @@ export function Card({
     <Tag
       id={id}
       className={cn(
-        "rounded-[14px] border border-line bg-surface shadow-[0_1px_0_rgba(23,26,22,0.035)]",
+        "rounded-[14px] border border-line bg-surface shadow-[0_1px_0_rgba(0,0,0,0.35)]",
         className,
       )}
     >
