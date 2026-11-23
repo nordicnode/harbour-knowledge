@@ -12,7 +12,7 @@ This is the first implementation slice of [support-knowledge-base-design-spec.md
 | Upload / URL ingestion with background jobs, duplicate aliases, heading-aware parent + child chunks, contextual blurbs | Done |
 | Hybrid dense + lexical retrieval with Reciprocal Rank Fusion, SQL metadata filters, reranking, exact error-code lookup | Done |
 | Canonical answers: automatic drafts from sources and fallback questions, one-click publish, edit as a new immutable version, archive, freshness dates | Done |
-| Answering from approved answers first; labelled fallback from raw passages; citations verified against stored quotes; abstention | Done |
+| Answering from approved answers first; labelled fallback from raw passages; verbatim extraction of a stated attribute; citations verified against stored quotes; abstention | Done |
 | Visibility isolation (public vs internal) and plan/version scope enforced in SQL before ranking | Done |
 | Review queue: new answers, edits, conflicts, change impact, stale-answer feedback | Done |
 | Conflict detector with permanent registry and review resolutions | Done |
@@ -57,11 +57,15 @@ Supported uploads have these extensions: `.pdf`, `.docx`, `.pptx`, `.html`, `.ht
 
 Ingestion claims are persisted before processing; abandoned running jobs are requeued after 30 minutes, up to three recovery attempts. A failed replacement retains the last complete indexed version and reports the failed job. Manually re-queueing resets the recovery budget. URL snapshots are immutable; a crash can leave an unreferenced snapshot that is not automatically cleaned up.
 
+Separators are not knowledge: a horizontal rule or any other block without a letter or digit never becomes a passage, because a near-neutral vector for `---` outranks real evidence in dense ranking while offering nothing to cite. Contextual blurbs are written once per section and shared by that section's passages rather than once per passage; on a single GPU that removes most of ingestion's model calls while keeping the document, section, plan and version context in the embedded text.
+
 The local embedding provider checks its configured token limit before encoding. Oversized tables and passages may be split; an indivisible oversized table row, sentence, or code block fails with a message to split the source. Existing sources are not automatically re-ingested, and existing embeddings may already have been truncated. Re-ingestion creates a new document version and can require review of answers citing the older one. Remote embedding providers do not yet have equivalent truncation checks.
 
 Dense retrieval is gated by an embedding identity: provider, model, dimensions, query instruction, sequence limit, embedding version, and ingestion pipeline revision. A passage is only considered for dense ranking when its recorded identity matches the active configuration. If they differ, Search and Ask use keyword matching and say the index needs rebuilding instead of comparing incompatible vectors; `/v1/meta` reports compatible, stale, and total passage counts. After changing any of those settings, run `make reindex` for the default workspace. For another workspace, run `cd services/api && uv run --extra local-embeddings python -m app.reindex <slug>`. The rebuild embeds in committed batches, switches one workspace atomically, and resumes staged batches after an interruption. An older passage that exceeds the new limit stays out of the rebuilt index and must be re-ingested so the chunker can split it.
 
-To run the PostgreSQL ingestion failure tests against the migrated database, use `cd services/api && HARBOUR_TEST_POSTGRES=1 ./.venv/bin/python -m pytest -q tests/test_ingest_atomicity.py`. They create and remove an isolated temporary tenant and do not reset your workspace.
+**Upgrading from pipeline revision 2:** the embedded text of a passage changed (separators are no longer indexed and blurbs are per section), so the identity is now `p3-…`. Existing passages stay out of dense ranking until you re-ingest each source and then run `make reindex`; `make seed` is the clean reset for a demo workspace.
+
+To run the PostgreSQL ingestion failure tests against the migrated database, use `cd services/api && HARBOUR_TEST_POSTGRES=1 ./.venv/bin/python -m pytest -q tests/test_ingest_atomicity.py`. They create and remove an isolated temporary tenant and do not reset your workspace. Stop the API first, or hold the worker's lock (`psql "$MIGRATION_DATABASE_URL" -c "select pg_advisory_lock(1212240450)" -c 'select pg_sleep(120)' &`), because the ingestion worker is global by design and will otherwise claim a test tenant's queued job while the suite is running.
 
 ## Fully local chat
 
@@ -89,9 +93,24 @@ LOCAL_EMBEDDING_DEVICE=cpu
 LOCAL_EMBEDDING_DTYPE=float32
 ```
 
-On a 6 GB card, the chat model takes the GPU and the 0.6B embedder runs on the CPU. Putting both on the GPU leaves no headroom and can fail with CUDA out-of-memory; the CPU embedder still indexes the demo corpus in about 3.4 seconds. If you have more VRAM, set `LOCAL_EMBEDDING_DEVICE=cuda` and restart the API. Changes to embedding model or dimension need `make reindex`.
+On a 6 GB card, the chat model takes the GPU and the 0.6B embedder runs on the CPU. Putting both on the GPU leaves no headroom and can fail with CUDA out-of-memory. On the reference i5-9400, a warm CPU process embeds about eight variable-length passages in 10 seconds and sixteen in 24 seconds; the earlier “few seconds” estimate was optimistic. If you have more VRAM, set `LOCAL_EMBEDDING_DEVICE=cuda` and restart the API. Changes to embedding model or dimension need `make reindex`.
 
-`make local-chat` uses the project-local runtime in `storage/`; set `OLLAMA_BIN` to use a system-wide Ollama instead. The first request after a cold start loads the model in a few seconds. Keep the Ollama server running while using Ask or ingestion.
+### Embedding speed on CPU
+
+CPU inference does not benefit from large batches the way a GPU does. Sentence-Transformers pads every item in a batch to the longest item, so a batch of sixteen variable-length chunks can do much more work than sixteen independent encodes. On the reference i5-9400, batch `1` measured **10.15 s** for eight passages versus **14.67 s** at batch `8`; sixteen passages measured **23.84 s** at batch `1` versus **30.12 s** at batch `8`. The provider uses `LOCAL_EMBEDDING_CPU_BATCH_SIZE=1` by default while leaving `LOCAL_EMBEDDING_BATCH_SIZE=16` for GPU inference. Through the full provider path, including token-limit checks, the same eight passages took 12.6 s at batch 1 versus 19.6 s at batch 16.
+
+Repeated query strings are cached in-process (`LOCAL_EMBEDDING_QUERY_CACHE_SIZE=256` by default), so asking the same question again skips the CPU model entirely. Document embeddings are not cached because the index already stores them. `LOCAL_EMBEDDING_THREADS=0` uses PyTorch's default; on a 6-core machine that also runs the API and chat, try `4` and compare. A quantized ONNX build of Qwen3 was tested and rejected here: it preserved vectors (cosine ≥ 0.9996) but was slower than PyTorch on this CPU.
+
+### Answers that need no model call
+
+Two paths keep asking cheap on this hardware, and both are deterministic:
+
+- A question that is already standalone skips the rewrite call entirely. Only a follow-up (or a question that refers back with "it", "they", "that", or opens with "and"/"what about") is sent to the model to resolve.
+- When the question names a product ("i5 9400") and asks for one stated attribute ("TDP", "cores", "cache"), Harbour extracts the exact two-column row from the top-ranked document and cites it verbatim. A named identifier in the question is a constraint: an `L4` question is never answered from an `L3` row, rows that disagree are refused, and a document that merely mentions the product in passing is not used. The returned text is copied from the source, so it verifies by construction and costs no tokens.
+
+Measured on the reference machine (i5-9400, 16 GB, GTX 1660 Super 6 GB, Qwen3-4B on the GPU, embeddings on the CPU), against a 32-passage product document: attribute questions answered in **2–4 s** with one model call, a semantic question ("When was the i5 9400 released?", answered by "Launched on January 7, 2019") in about 12 s, and out-of-scope or false-premise questions abstained rather than answered. Re-ingesting that document dropped from 39 model calls to 16 and indexed 32 passages instead of 39, with no separator fragments.
+
+`make local-chat` uses the project-local runtime in `storage/`; set `OLLAMA_BIN` to use a system-wide Ollama instead. The first embedding request after a cold start loads the model in roughly 6–10 seconds on the reference CPU. Keep the Ollama server running while using Ask or ingestion.
 
 ## The demo loop
 
@@ -141,10 +160,15 @@ Copy `.env.example` and keep the defaults for a local demo. Important variables:
 - `AI_MODE=dev` — deterministic offline chat. Set `AI_MODE=openai` and fill the chat model variables to use an OpenAI-compatible endpoint, including local Ollama.
 - `EMBEDDING_PROVIDER=local` — run embeddings on this machine with Sentence-Transformers. `dev` is the deterministic fallback; `openai` uses the endpoint's `/embeddings` route.
 - `LOCAL_EMBEDDING_MODEL` — defaults to `Qwen/Qwen3-Embedding-0.6B` (1024 dimensions, about 1.2 GB of VRAM at fp16). Set `LOCAL_EMBEDDING_DEVICE=cpu` when a local chat model is using the GPU.
+- `LOCAL_EMBEDDING_CPU_BATCH_SIZE` — CPU batch size, default `1`; avoids variable-length padding. GPU inference uses `LOCAL_EMBEDDING_BATCH_SIZE` instead.
+- `LOCAL_EMBEDDING_THREADS` — `0` leaves PyTorch's default; on a 6-core CPU also running the API and chat, `4` can be faster overall.
+- `LOCAL_EMBEDDING_QUERY_CACHE_SIZE` — in-process cache for repeated query strings, default `256`; set `0` to disable.
 - `make local-chat*` — install, start, pull, and warm the local Ollama model documented above.
 - `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_PORT` — Docker bootstrap values, read by `docker compose`. Keep `MIGRATION_DATABASE_URL` in sync if you change them.
 - `OPENAI_EMBEDDING_DIMENSIONS` — defaults to `true` and asks OpenAI-compatible embedding endpoints for 1024 dimensions. Disable it only for a provider that rejects the optional parameter; the model must still return exactly `EMBEDDING_DIM` values.
 - `INTERNAL_LOW/HIGH_THRESHOLD` and `PUBLIC_LOW/HIGH_THRESHOLD` — abstention bands.
+- `DENSE_EXACT_MAX_CHUNKS` — use exact cosine search when the filtered eligible chunk count is at most this value (default 5,000); above it, use HNSW. Set to `0` to force HNSW.
+- `MAX_CHILDREN_PER_PARENT` — maximum child passages kept from one section (default 2), so a rule and its exception can both be returned.
 - `API_URL`, `DEV_TENANT_SLUG`, `DEV_USER_EMAIL` — read by the Next server.
 
 The index uses 1024 dimensions (migration 006). Changing the embedding provider, model, dimensions, query instruction, sequence limit, or `EMBEDDING_VERSION` changes the index identity. Run `make reindex` after any of those changes; until then dense retrieval is disabled for the workspace and the API reports keyword-only mode. `make reindex` rebuilds the default workspace only; pass another slug to `python -m app.reindex`. `make api`, `make seed`, `make reindex`, and `make test` automatically include the local embedding extra only when `.env` sets `EMBEDDING_PROVIDER=local`; override with `UV_EXTRA=local-embeddings` or `UV_EXTRA=`.

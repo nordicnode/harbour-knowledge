@@ -224,7 +224,7 @@ export function AnswerCard({ result }: { result: AskResult }) {
         <IndexWarning warning={result.index_warning} />
 
         <div className="mt-4">
-          <AnswerText text={result.answer_md ?? ""} />
+          <AnswerText text={result.answer_md ?? ""} citations={result.citations} />
         </div>
 
         {result.citations.length ? (
@@ -247,7 +247,8 @@ export function AnswerCard({ result }: { result: AskResult }) {
               {result.citations.map((citation, index) => (
                 <details
                   key={citation.evidence_id}
-                  className="group border-b border-line/80 last:border-b-0"
+                  id={`evidence-${citation.evidence_id}`}
+                  className="group scroll-mt-24 border-b border-line/80 last:border-b-0"
                 >
                   <summary className="flex cursor-pointer list-none items-center gap-2.5 px-3.5 py-2.5 text-[11.5px] hover:bg-surface">
                     <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-[5px] bg-pine-soft font-mono text-[10px] text-pine-dark">
@@ -259,7 +260,9 @@ export function AnswerCard({ result }: { result: AskResult }) {
                     <ChevronDown size={13} className="shrink-0 text-faint transition-transform group-open:rotate-180" />
                   </summary>
                   <div className="border-t border-line/70 bg-surface px-4 py-3">
-                    <p className="text-[12.5px] leading-relaxed text-ink-2">“{citation.quote}”</p>
+                    <div className="border-l-2 border-line pl-3">
+                      <AnswerText text={citation.quote} dense />
+                    </div>
                     <p className="mt-2 text-[10.5px] text-faint">
                       {citation.source_title}
                       {citation.source_date ? ` · ${citation.source_date}` : ""} · {citation.section_path}

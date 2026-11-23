@@ -6,6 +6,8 @@ Make ingestion, storage, retrieval, and answering **reliable and measurably accu
 
 This is an implementation plan, not a claim that the improvements are already complete. It is based on a review of the current working tree, including uncommitted changes. The existing development authentication is not suitable for exposure to untrusted users; production currently fails closed.
 
+**Status snapshot (2026-11-23):** the API suite reports **89 passed, 16 skipped**; the skips are opt-in PostgreSQL integration tests. Answer selection, claim-level lexical grounding, atomic replacement, parser preservation, separator removal, bounded chunks, embedding identity, and staged reindex are implemented and covered by focused tests. The saved `evaluation/baseline-dev.json` is a **pre-fix synthetic baseline**; do not use it as the current score. A representative held-out corpus, a current end-to-end baseline, duplicate-answer cleanup, exact-identifier retrieval, provider preflight, and the security work remain open. The local model server is a manual process; a stopped server must produce an actionable 503, never a fabricated answer.
+
 ### Guiding principles
 
 - Preserve source content and provenance; do not silently convert uncertain extraction into authoritative knowledge.
@@ -18,20 +20,42 @@ This is an implementation plan, not a claim that the improvements are already co
 
 ## Current assessment and priorities
 
-| Priority | Area | Main risk | Outcome sought |
+| Priority | Area | Status | Main remaining risk or next action |
 |---|---|---|---|
-| P0 | Answer selection and scope | A relevant passage can cause an unrelated canonical answer to be returned; missing scope can mix incompatible policies. | Correct answer matching, explicit scope handling, safe abstention. |
-| P0 | Evidence and ingestion transactions | Quote existence is treated as faithfulness; failed ingestion may leave partial work. | Honest evidence verification and atomic ingestion. |
-| P0 | Evaluation | The existing small unit suite does not establish end-to-end accuracy. | A reproducible baseline and regression gates. |
-| P1 | Parsing and chunking | Content, ordering, page references, and embedding input can be lost or distorted. | Faithful extraction, provenance, and bounded chunks. |
-| P1 | Embedding lifecycle and freshness | Mixed embedding models, aliases, or changed evidence can lead to missing or stale knowledge. | Explicit index identity, safe reindex, and rechecks. |
-| P1 | URL and data security | URL fetching and development authentication are unsafe for an untrusted deployment. | Controlled fetching, private data handling, real authentication before exposure. |
-| P2 | Ranking and performance | Lexical reranking and repeated model calls may reduce quality or add latency. | Measured, resource-conscious improvements. |
-| P2 | Conflict detection and operations | Heuristic conflict detection and review dates do not guarantee freshness or completeness. | Explicit governance, observability, and tested recovery. |
+| P0 | Answer selection and scope | Implemented for covered cases | Held-out false-match rate, duplicate-answer cleanup, and scope normalization remain. |
+| P0 | Evidence and grounding | Implemented lexical safeguards | Semantic paraphrase, dropped conditions, and comparatives still need evaluation; this is not entailment. |
+| P0 | Ingestion transactions | Implemented; opt-in integration coverage | Stage visibility, crash injection, and snapshot cleanup remain. |
+| P0 | Evaluation | Harness exists; saved baseline is stale | Build a representative held-out set and regenerate the baseline before tuning. |
+| P1 | Parsing and chunking | Mostly implemented | OCR, XLSX/EPUB/images, source offsets, and complex tables remain. |
+| P1 | Embedding lifecycle | Implemented staged reindex | Concurrent-reindex lock, dashboard status, and remote truncation remain. |
+| P1 | Provider availability | **Partly implemented** | Actionable errors exist; preflight/status and an in-app retry path remain. |
+| P1 | URL and data security | Open | SSRF-safe fetching and real authentication before any untrusted exposure. |
+| P2 | Ranking and performance | Partially measured | Fusion sweep, cross-encoder benchmark, exact-identifier retrieval, and a representative exact-scan/child-cap comparison remain. |
+| P2 | Conflict detection and operations | Open | Freshness/review operations and honest limits on conflict detection. |
+
+## Next milestone — make local operation and evaluation trustworthy
+
+These are the next actions in order. Detailed rationale and acceptance criteria remain in the phases below.
+
+1. **Provider preflight and recovery.** Expose chat and embedding reachability separately, make a stopped local server obvious before Ask, and keep the failure fail-closed with a retry path. Starting `make local-chat` must recover without restarting the API.
+2. **Regenerate the evaluation baseline and add a held-out split.** Run the current stack, save the report with corpus hash, model/config, and per-stage metrics, and stop tuning on the development cases. The existing synthetic baseline is pre-fix and must not be cited as current.
+3. **Add the Mikey end-to-end regression.** Exercise upload, ingestion, retrieval, generation, citation validation, and the final internal Ask response. Add the public, different-person, absent-age, and invalid-citation negatives.
+4. **Clean up canonical duplicates.** Find existing near-duplicate approved questions, merge them through review, and prevent a new wording variant from creating a second canonical answer.
+5. **Add exact-identifier retrieval.** Use a dedicated exact query for error codes and named product identifiers, then verify it with `E4021` and a false identifier.
+6. **Run the security gate before exposure.** Do not expose URL ingestion or the development session stub until SSRF protections and real tenant authentication are tested.
+
+### Release gates for this milestone
+
+- Stopping the local model server produces an actionable 503 naming the endpoint and start command, with no fallback answer; restarting it recovers without an API restart.
+- The API suite is green, the opt-in PostgreSQL suite has been run against an isolated database, and the current integration count is recorded in the report.
+- A new baseline exists, is reproducible from the recorded corpus hash and configuration, and the held-out split has not been used for tuning.
+- The eligible Mikey internal case returns a supported, correctly cited, time-qualified answer; the public and negative cases still abstain.
+- The CPU wording variants do not create a second canonical answer; existing duplicates are either merged or explicitly queued for review.
+- `E4021` retrieves its exact source and a false identifier does not; no public answer cites internal evidence.
 
 ## Phase 0 — establish a trustworthy baseline
 
-**Do this first, before tuning or selecting a new model.**
+**Status:** a synthetic development harness and a saved pre-fix baseline exist. The corpus is too small and synthetic to serve as a quality benchmark, and the saved report predates the fixes. Completing a current, representative baseline is the gate for any ranking, model, or threshold change.
 
 1. Create a versioned evaluation corpus representative of actual documents: policies, pricing, procedures, error messages, tables, PDFs, and any important customer-specific formats. Include public/internal sources, multiple plans and product versions, updated sources, and intentionally conflicting material.
 2. Build a labeled question set with expected answer or acceptable answers, relevant evidence spans, audience, plan, product version, date where applicable, and whether the correct behavior is to abstain or ask a clarifying question. Include:
@@ -48,7 +72,7 @@ This is an implementation plan, not a claim that the improvements are already co
    - Grounding: unsupported or contradicted claim rate, citation validity and claim-to-citation support, checked by a human-labeled sample.
    - Safety: correct abstention/clarification, false-answer rate on unanswerable and ambiguous cases, public/internal and tenant isolation.
    - Performance: cold and warm p50/p95 end-to-end and per-stage latency, ingestion throughput, peak RAM and VRAM, and database/index size.
-5. Save a baseline report before fixes. Define release thresholds based on the cost of wrong answers and the baseline; do not invent accuracy targets or interpret heuristic confidence as a calibrated probability.
+5. Save a baseline report before further tuning. Define release thresholds based on the cost of wrong answers and the baseline; do not invent accuracy targets or interpret heuristic confidence as a calibrated probability.
 
 **Acceptance:** the same corpus and questions can be rerun locally; results distinguish retrieval, selection, grounding, and latency; a held-out set is untouched by tuning.
 
@@ -85,7 +109,9 @@ This is an implementation plan, not a claim that the improvements are already co
 
 ### 1.3 Verify grounding without overstating confidence
 
-**Current behavior:** canonical faithfulness is based on the fraction of quotes that still exist; [fallback faithfulness](services/api/app/retrieval/search.py#L267) is lexical overlap. In a local reproduction, an answer and its negation received a score of 1.0. The [retry path](services/api/app/retrieval/answer.py#L675-L684) can accept an improved score without checking that it reaches the original minimum.
+**Progress:** claim support is now judged per claim against the exact cited child passage, accepting three standards: verbatim, near-extractive (every content word kept, identical numbers, units and negation polarity), and markup-only difference (table pipes and emphasis removed). Short value answers are supported with their unit. A claim that drops a condition ("only Enterprise", "within 30 days") or adds a clause is refused, and a single content word is never accepted on its own because the same digit appears in many rows of one table. Detection remains a safeguard, not entailment.
+
+**Residual behavior:** canonical-answer faithfulness still counts whether its stored quotes are present and current; fallback answers use the per-claim lexical check above. The old reproduction where an answer and its negation both scored 1.0 is now rejected by the contradiction guard, and retries must reach the same grounding threshold and respect `abstain` ([retry path](services/api/app/retrieval/answer.py#L1151-L1156)). The remaining weakness is semantic: a genuine paraphrase, a dropped condition, or a comparative can still be rejected or, in narrow cases, accepted on lexical overlap. The score is reported as faithfulness, not as a probability that the answer is correct.
 
 **Plan**
 
@@ -109,12 +135,21 @@ Mikey was born on August 8th, 1986.
 
 Asking **“How old is Mikey?”** produced “I could not answer that safely” with the reason “The answer could not be grounded in the retrieved evidence.” For an internal Ask request, the system should be able to answer from an eligible current passage rather than abstaining merely because a short, clearly relevant claim or citation is mishandled. Public channels must continue to require an eligible approved public answer; an uploaded passage alone is not sufficient for a public answer.
 
-**What is known:** in the current answer path, that specific reason is returned when generation reports abstention, returns no answer, or supplies no valid cited passage IDs. It does not by itself establish which condition occurred. A local isolated check using the development generator preserved both sentences, produced an answer and a valid cited ID, and gave a faithfulness score of 1.0. This did **not** reproduce the reported end-to-end failure or establish its cause; the actual provider, indexed passage, request scope, and generation response still need investigation. The same isolated check selected the birth-date sentence as the supporting excerpt for the combined generated answer, which also warrants testing for claim-level citation relevance.
+**Progress:** the reported failure was reproduced and traced on the reference machine with the documented local stack, and it had four independent causes, all repaired:
+
+1. **The local model's citations were discarded.** It returns `cited_ids: ["P:E2"]` and writes `[P:E2]` inline, while the parser only accepted bare `E2`. A correct answer was therefore treated as uncited. Labels are now normalised (`E2`, `P:E2`, `[P:E2]`) and recovered from the answer text when the array is empty; a label the request did not supply is still rejected.
+2. **The lexical reranker overrode correct retrieval.** Ordering used the reranker score alone. With no cross-encoder configured that score is lexical overlap, which is nearly identical for every passage of a document that names the subject. In a measured case the correct passage ranked first by dense retrieval and first by RRF while sharing no vocabulary with the question ("released" vs "Launched"), and the reranker pushed it out of the top four. Final ordering now retains a calibrated fusion signal (weight 0.3) alongside the reranker.
+3. **Averaging a fixed top three diluted a filtered query.** With `plan=v2` only one passage is eligible, so two filler passages' zero scores divided a good match by three and pushed a supported answer below the abstention band. Zero-scored passages no longer count toward retrieval strength.
+4. **The offline provider required every question word verbatim.** "Mean" never matched "means" and "need" never matched "require", so the deterministic evaluation path abstained on correct evidence. Gating terms now use inflection matching (shared four-character prefix, never for digits or identifiers) and words that describe the kind of answer (`need`, `mean`, `require`, `support`) no longer gate. Each removed cause has a regression test.
+
+**Still needed:** a genuine paraphrase on a customer-facing channel still abstains unless the model writes an approved answer (by design) or the semantic equivalence check succeeds; the fusion weight is a measured default on one corpus, not a calibrated optimum; and the deepest retrieval gap remains: a question whose vocabulary is absent from the source ("released" vs "Launched") depends entirely on the embedding model until a cross-encoder reranker is evaluated.
+
+**Historic investigation note (pre-fix):** that specific reason is returned when generation reports abstention, returns no answer, or supplies no valid cited passage IDs. A local isolated check using the development generator preserved both sentences, produced an answer and a valid cited ID, and gave a faithfulness score of 1.0, but it did **not** reproduce the reported end-to-end failure. The four causes above are now guarded by focused tests, yet a full end-to-end Mikey fixture with the configured local provider is still the acceptance test. The same isolated check selected the birth-date sentence as the supporting excerpt for the combined generated answer, so claim-level citation relevance also remains a test case.
 
 **Plan**
 
-- Add an end-to-end regression fixture with this exact document and question, exercising ingestion, retrieval, generation, citation validation, and the final internal Ask response. Run it with the development provider and the configured local chat/embedding providers where available. Inspect redacted stage diagnostics and reproduce the reported outcome before attributing a cause.
-- Identify whether the problem is missing or stale indexing, retrieval or scope eligibility, invalid/missing generated citation IDs, a provider abstention, answer parsing, or a grounding gate. Repair the actual failure without bypassing evidence validation or lowering thresholds indiscriminately.
+- Add an end-to-end regression fixture with this exact document and question, exercising ingestion, retrieval, generation, citation validation, and the final internal Ask response. Add a regression that would have failed before these fixes and passes now; the four focused tests above prove the individual causes, but only this fixture proves the final response.
+- Keep provider-dependent checks separate from deterministic unit tests. If the configured local chat or embedding provider is unavailable, report the end-to-end test as skipped, not passed, and never substitute the development provider for a claimed local-model result.
 - Ensure short supported statements and short answers can be grounded; the current lexical faithfulness check excludes sentences of 25 characters or fewer. Verify that each returned claim is linked to the passage and exact excerpt that supports it, rather than merely choosing a broadly related sentence.
 - Define time-dependent age semantics. A stated age can become stale; a date of birth supports a calculated age only with an explicit reference date and correct birthday handling. Prefer a qualified statement of what the source says, or calculate and label age **as of** a known date when policy permits; do not silently present a stale age as current. Mark conflicting or insufficiently dated age information for clarification or review.
 - Include nearby negative cases: a different person, an absent age or birth date, mismatched or invalid citation IDs, an internal-only source queried through a public channel, and dates before and after a birthday. Confirm these do not become unsupported answers when the positive case is fixed.
@@ -154,7 +189,7 @@ Asking **“How old is Mikey?”** produced “I could not answer that safely”
 
 ### 2.3 Improve parsers, supported formats, and provenance
 
-**Progress:** PDF empty-text detection now examines extracted text, including short text; pages without extractable text are recorded in document metadata. PDF sections and passages are split at page boundaries, and new documents record unknown parse quality instead of an unmeasured perfect score. DOCX paragraphs and tables retain their order; HTML traversal avoids duplication of nested blocks and handles common table spans. Explicit re-ingestion rebuilds older indexes, even when the normalized text is unchanged.
+**Progress:** PDF empty-text detection now examines extracted text, including short text; pages without extractable text are recorded in document metadata. PDF sections and passages are split at page boundaries, and new documents record unknown parse quality instead of an unmeasured perfect score. DOCX paragraphs and tables retain their order; HTML traversal avoids duplication of nested blocks and handles common table spans. Explicit re-ingestion rebuilds older indexes, even when the normalized text is unchanged. Separator-only blocks are no longer indexed: a horizontal rule produced a passage whose entire text was `---`, whose near-neutral embedding outranked real evidence (measured: 0.7425 for `---` against 0.7241 for the paragraph stating the answer) while providing nothing to cite. Separator lines are now treated as separators when a section is assembled and when child blocks are split, while fenced content such as a YAML `---` is preserved. On the reference document this removed 7 of 39 passages.
 
 **Still needed:** absent PDF text may indicate a scan or an intentionally blank page; OCR and a reviewer-facing warning are not implemented. Complex nested tables and irregular DOCX rows are rejected rather than silently misrepresented; multi-level table headers and other complex structures need further evaluation. XLSX, EPUB, and images are rejected at upload because their parsers are not implemented. Source offsets, comprehensive parser fixtures, and safe re-review of answers affected by replacement remain open.
 
@@ -172,7 +207,7 @@ Asking **“How old is Mikey?”** produced “I could not answer that safely”
 
 **Progress:** the local embedding provider checks untruncated model inputs, including special tokens, default prompts, contextual blurbs and query instructions, against its configured limit before encoding. Ingestion splits oversized multi-row tables at row boundaries with repeated headers and prose or lists at existing boundaries. It removes an overlong generated blurb rather than truncating source content. Unsplittable rows, code blocks, long individual sentences and unpunctuated blocks fail ingestion explicitly; a failed replacement keeps the prior version. Explicit re-ingestion rebuilds older indexing versions.
 
-**Still needed:** splitting at sentence or list boundaries can separate related conditions and needs evaluation, overlap and source offsets. Very large code blocks and individual sentences require manual splitting. These checks apply only to the local embedding provider; remote provider limits and silent truncation are not verified. Existing indexed passages remain unchanged until explicitly re-ingested, and old vectors may already be truncated. Child deduplication by parent can hide other matching chunks. Large split operations still need throughput/resource benchmarks.
+**Still needed:** splitting at sentence or list boundaries can separate related conditions and needs evaluation, overlap and source offsets. Very large code blocks and individual sentences require manual splitting. These checks apply only to the local embedding provider; remote provider limits and silent truncation are not verified. Existing indexed passages remain unchanged until explicitly re-ingested, and old vectors may already be truncated. The two-child-per-section cap can still hide a third matching chunk; one child remains available for controlled comparisons. Large split operations still need throughput/resource benchmarks.
 
 **Plan**
 
@@ -220,7 +255,11 @@ Asking **“How old is Mikey?”** produced “I could not answer that safely”
 
 ### 4.1 Evaluate retrieval and ranking changes
 
-**Current behavior:** [hybrid search](services/api/app/retrieval/search.py#L115-L187) fuses dense and lexical candidates, then sorts solely by reranker scores. The default reranker is lexical when no rerank endpoint is configured. The Ask rewrite extracts error codes, but Ask does not use them for a dedicated exact search. Generation receives parent text while citations identify child passages.
+**Progress:** final ordering now blends the reranker score with a normalised reciprocal-rank-fusion signal (`FUSION_WEIGHT = 0.3`), because the default lexical reranker cannot separate passages of one document and was discarding a correct dense+RRF ranking. Comparison terms are lightly inflected so "expense"/"expenses" agree without touching stored vectors. A deterministic extractor answers a stated two-column attribute of a named product from the top-ranked document, refuses identifiers the row does not satisfy (`L4` from an `L3` row), refuses disagreeing rows, and requires the document to be about that product. In an instrumented development run (not yet saved as a fresh baseline), the false-abstention rate went from 0.40 to 0.0 with no false answers and unchanged hit@1/MRR; on the real local stack 5 of 5 answerable product questions answered and 6 of 6 must-abstain cases abstained.
+
+**Progress (2026-11-22):** dense retrieval now chooses an exact cosine scan when the filtered eligible chunk count is at most `DENSE_EXACT_MAX_CHUNKS` (default 5,000), otherwise it uses HNSW; the response reports which path ran. Selection keeps up to two children per section instead of one. On the local 32-chunk corpus, twelve labeled i5-9400 questions gave identical hit@1 0.75, hit@5 1.00, and MRR 0.854 for HNSW and exact scan, with warm search medians of 21.2–21.8 ms; the exact path added no measurable end-to-end cost at this size. On three multi-part questions, two children recovered both expected facts in the package/junction-temperature and L3-cache/TLB cases where one child returned only one; the socket/chipset case still missed the chipset table. A separate synthetic-vector benchmark measured an exact scan at about 5.4 ms for 1k, 26.3 ms for 5k, and 57.6 ms for 10k chunks, against under 0.4 ms for HNSW; those warm timings measure the vector scan, not the full search.
+
+**Residual behavior:** [hybrid search](services/api/app/retrieval/search.py#L115-L187) keeps a fusion signal alongside the reranker (`FUSION_WEIGHT = 0.3`). The default reranker is still lexical when no rerank endpoint is configured. The Ask rewrite extracts error codes, but Ask still does not use them for a dedicated exact search. Generation receives parent text while citations identify child passages. The exact-scan threshold is a latency/recall trade-off measured on synthetic vectors; it did not improve accuracy on the small local corpus, and filtered HNSW recall above the threshold has not been measured on representative data. The two-child cap is a fixed default, not an evaluated optimum. The fusion weight and a real cross-encoder have not been benchmarked on this hardware.
 
 **Plan**
 
@@ -228,19 +267,24 @@ Asking **“How old is Mikey?”** produced “I could not answer that safely”
 - Add robust exact-identifier retrieval for error codes, product names, and other critical identifiers without discarding semantic recall. Confirm actual SQL plans and index use with representative data.
 - Evaluate a small CPU-compatible local reranker only if it improves held-out answer quality enough to justify p95 latency and memory cost. Do not add it solely because it is more sophisticated.
 - Keep evidence identity aligned with text provided to generation: either cite exact child spans or represent expanded context with accurate provenance. Deduplicate near-identical contexts without hiding independent authoritative evidence.
-- Test approximate vector-index recall under tenant, visibility, scope, and date filters against exact search. Tune index/query settings only after measuring corpus size, memory, latency, and recall.
+- Test approximate vector-index recall under tenant, visibility, scope, and date filters against exact search. Sweep the exact-scan threshold and the per-section child cap on a representative corpus, measuring filtered recall as well as latency; tune index/query settings only after measuring corpus size, memory, latency, and recall.
 
 **Acceptance:** relevant-evidence recall and false matches are measured before and after. Error-code, filtered, paraphrase, and provenance cases have regression tests; no ranking change is accepted on latency alone.
 
 ### 4.2 Measure and reduce expensive work
 
-**Current behavior:** ingestion performs a contextualization call for each chunk sequentially ([pipeline](services/api/app/ingest/pipeline.py#L270-L283)); Ask performs query rewriting and embedding before canonical matching. The local embedding model serializes its own calls with a lock.
+**Progress:** ingestion writes one contextual blurb per section and shares it across that section's passages, instead of one model call per passage; the same document dropped from 39 calls to 16 (102 s wall clock, warm model). A question that is already standalone skips the rewrite model call entirely; only history or a pronoun-led follow-up uses it. A verified attribute extraction now runs before any retry generation call, so a factoid answer costs one model call (2–4 s measured) rather than two.
+
+**Progress (2026-11-22):** CPU embeddings now use a CPU-only batch of 1 by default. On the reference i5-9400, eight real passages took 12.6 s at batch 1 versus 19.6 s at batch 16 through the full provider path, a 36% reduction. Repeated query strings hit a bounded in-process cache (about 0.02 ms versus roughly 300 ms for the first encode); a live repeated search fell from about 417 ms to 34 ms, while a unique warm query still costs about 338 ms. Model load remains roughly 6–10 s and is paid lazily. Limiting PyTorch to four threads measured 10.59 s versus 10.68 s at six threads for eight passages, so it remains opt-in rather than a default. A quantized ONNX Qwen build preserved vectors (cosine ≥ 0.9996) but was slower here (12.5 s for eight passages, 733 ms per query), so it was rejected. GPU embedding measured 4.24 s for eight passages and about 134 ms per query, but cannot safely share a 6 GB card with the 4.4 GB chat model.
+
+**Residual behavior:** ingestion now generates one contextual blurb per section, but sections are still processed sequentially ([pipeline](services/api/app/ingest/pipeline.py#L270-L283)), ingestion remains serial per document, and no per-stage timing is persisted. Ask still performs any needed rewrite and embedding before canonical matching. The local embedding model serializes its own calls with a lock and loads per process. The 0.6B model is still the dominant CPU cost; batch sizing and caching reduce repeated work but do not change per-vector compute. A smaller 1024-dimension English model (BAAI/bge-large-en-v1.5) measured about 16.7 s for sixteen passages versus 23.8 s for Qwen, but it is English-only and requires a reindex, so it remains an evaluated option rather than a default.
 
 **Plan**
 
 - Measure per-stage time, model warm-up, CPU use, RAM, GPU memory, prompt length, queue wait, and database time. Separate ingestion from interactive Ask measurements.
 - Compare generated contextual blurbs with deterministic title/section/scope context; keep generated blurbs only where they improve measured retrieval enough to justify cost and potential invented context.
-- Evaluate batching embeddings across appropriately bounded chunks and reusing loaded models. Bound batch size and inference concurrency to avoid CPU contention and GPU out-of-memory failures.
+- Evaluate batching embeddings across appropriately bounded chunks and reusing loaded models. CPU and GPU need separate batch policies: CPU batches should avoid variable-length padding, while GPU batches should use it. Bound batch size and inference concurrency to avoid CPU contention and GPU out-of-memory failures.
+- Evaluate a smaller 1024-dimension model on the held-out corpus before changing the embedding identity. Measure retrieval quality as well as CPU speed, and require a reindex and rollback plan.
 - Test a scope-safe exact canonical fast path, compact evidence windows, and skipping unnecessary rewriting for simple standalone questions. Check quality as well as speed; do not bypass security or evidence checks.
 - Tune Postgres and index settings only with actual query plans and workload measurements. Avoid broad parallelism or extra heavyweight models by default on 16 GB RAM / 6 GB VRAM.
 - Keep the documented local-chat-on-GPU and local-embeddings-on-CPU configuration as a starting point, not a measured guarantee. Record actual model, quantization, context size, batch size, and warm/cold conditions for every benchmark.
@@ -276,15 +320,27 @@ Asking **“How old is Mikey?”** produced “I could not answer that safely”
 
 **Acceptance:** reviewers can identify affected claims, sources, scope and resolution history; unresolved conflicts and overdue evidence behave according to a tested policy.
 
-## Suggested delivery order
+### 5.3 Keep the local model server available and diagnosable
 
-1. **Baseline and regression fixtures:** assemble the evaluation set and capture current results.
-2. **Answer safety:** canonical matching, normalized/missing scope, honest grounding checks, and safe retry behavior.
-3. **Ingestion integrity:** rollback/failure handling, preservation of source content, parser/page fixes, and bounded chunks.
-4. **Index and lifecycle:** embedding identity, staged reindex, alias semantics, and answer rechecks on changed evidence.
-5. **Security readiness:** hardened URL ingestion and real authentication before untrusted exposure.
-6. **Measured ranking and performance:** benchmark alternative ranking, exact identifiers, context size, and inference costs.
-7. **Governance refinement:** calibrated freshness and conflict workflows informed by actual errors.
+**Current behavior:** chat uses an OpenAI-compatible endpoint; on the reference machine this is a manually started project-local Ollama server. When it is not running, Ask returns `provider_unavailable`. The error now names the endpoint and `make local-chat`, but there is no preflight status and no in-app recovery path. A stopped server must never cause a fallback answer.
+
+**Plan**
+
+- Add a cheap readiness check for the chat endpoint, and separately for the embedding provider, that does not load a generation model or make a billable call. Keep database health separate.
+- Surface provider status in Ask and Search before submission: endpoint, start command, and a retry action. Do not silently switch to the deterministic development provider, which would change answer semantics.
+- Log provider failures with the endpoint and a correlation ID, never the API key. Keep the response a `provider_unavailable` error with no answer or gap draft.
+- Document the startup order and provide one command or script for the local model server, API, and web app. Keep `make local-chat` usable independently.
+- Test the stopped-server path, recovery without an API restart, and an ingestion attempt that fails cleanly without leaving a partial document.
+
+**Acceptance:** a stopped local model server is visible before a question is sent and produces an actionable error; recovery needs no API restart; no fallback answer is generated.
+
+## Delivery order and current position
+
+1. **Completed:** answer matching and lexical grounding safeguards; atomic ingestion/replacement; parser preservation, separator removal, and bounded chunks; embedding identity and staged reindex; actionable provider errors.
+2. **Next (M1):** provider preflight; regenerate the current baseline and add a held-out set; the Mikey end-to-end fixture; canonical duplicate cleanup; exact-identifier retrieval.
+3. **Before untrusted exposure:** SSRF-safe URL fetching and real authentication/tenant checks.
+4. **Then:** measured ranking and performance (fusion sweep, cross-encoder, compact evidence, batching) and governance/freshness work.
+5. **Ongoing:** every new production failure becomes an evaluation case; keep a current baseline and run the integration suite against an isolated database.
 
 Some items can be developed in parallel, but benchmark comparisons require a stable baseline. Schema or index changes should include a migration, a backup/rollback plan, and a decision on whether existing sources must be reprocessed.
 
@@ -299,6 +355,8 @@ Some items can be developed in parallel, but benchmark comparisons require a sta
 
 ## Evidence from the review
 
-The pre-implementation review found **9 passing** API unit tests. Small local reproductions confirmed that a negated claim can receive a faithfulness score of 1.0; a blockquote and standalone number can be removed; a 13-digit identifier can be redacted; a long unpunctuated chunk can exceed its target; nested HTML content can be duplicated; PDF page references can be wrong; and a blank three-page PDF can pass the extraction check. Those defects have since been repaired with focused unit tests; an opt-in PostgreSQL integration suite now covers ingestion atomicity, withdrawal locking, worker recovery, page provenance, bounded chunks, and staged reindex interruption/resume. The current `make test` run passes **75 tests** with 15 opt-in database tests skipped; run against an isolated database, that suite adds **14 passed, 1 skipped**.
+The pre-implementation review found **9 passing** API unit tests. Small local reproductions confirmed that a negated claim can receive a faithfulness score of 1.0; a blockquote and standalone number can be removed; a 13-digit identifier can be redacted; a long unpunctuated chunk can exceed its target; nested HTML content can be duplicated; PDF page references can be wrong; and a blank three-page PDF can pass the extraction check. Those defects have since been repaired with focused unit tests; an opt-in PostgreSQL integration suite covers ingestion atomicity, withdrawal locking, worker recovery, page provenance, bounded chunks, and staged reindex interruption/resume.
 
-The review itself did not perform a corpus-wide quality evaluation, live-model benchmark, or target-hardware benchmark. A synthetic evaluation harness now exists, but broad reviewed-corpus accuracy, peak RAM/VRAM, and cold/warm latency measurements remain open.
+The current API unit suite reports **89 passed, 16 skipped** (`services/api`, 2026-11-23). The skipped tests are the opt-in PostgreSQL suite; run it against an isolated database and record the exact integration count before citing it. The saved `evaluation/baseline-dev.json` predates the fixes and is not a current accuracy estimate.
+
+A local provider outage on 2026-11-23 returned `503` until the project-local Ollama server was started; the error now names the endpoint and `make local-chat`. A preflight/status check is still open. The review did not perform a corpus-wide quality evaluation, live-model benchmark, or target-hardware benchmark. A synthetic harness exists, but broad reviewed-corpus accuracy, peak RAM/VRAM, and cold/warm latency measurements remain open.

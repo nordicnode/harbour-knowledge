@@ -1,6 +1,14 @@
 """Opt-in PostgreSQL integration tests using an isolated temporary tenant.
 
 Run with HARBOUR_TEST_POSTGRES=1 from services/api against a migrated database.
+
+Stop the API first, or run these against a separate database: `queued_ingest_jobs`
+is SECURITY DEFINER on purpose, so a live ingestion worker sees a test tenant's
+queued job and races this suite for it (observed as "DID NOT RAISE" and a tenant
+delete deadlock). Holding the worker's advisory lock also parks it:
+
+    KEY=$(python3 -c 'print(0x48415242)')   # LEADER_LOCK_KEY
+    psql "$MIGRATION_DATABASE_URL" -c "select pg_advisory_lock($KEY)" -c 'select pg_sleep(120)' &
 """
 import asyncio
 import os
@@ -597,4 +605,36 @@ async def test_staged_reindex_switches_atomically_and_resumes(workspace, monkeyp
             conn, "service supports users", query_vector, channel="internal"
         )
     assert outcome.dense_index == "hybrid" and outcome.index_warning is None
+    assert outcome.passages
+
+
+@pytest.mark.asyncio
+async def test_plan_scope_filter_is_case_insensitive(workspace, monkeypatch):
+    """A model returning "Team" must still match sources scoped to "team"."""
+    from app.retrieval import search as search_module
+
+    tenant, source_id, job_id, connection, _, settings = workspace
+    async with connection(tenant) as conn:
+        await conn.execute(
+            "update sources set plan_scope = %s, visibility = 'public' where id = %s",
+            (["team"], source_id),
+        )
+    mock_url(monkeypatch, "# Team plan\n\nThe Team plan supports 10 users.")
+    await pipeline.run_ingest(tenant, source_id, job_id, auto_propose=False)
+    intelligence = DevIntelligence(settings.embedding_dim)
+    monkeypatch.setattr(search_module, "get_intelligence", lambda: intelligence)
+    query = "How many users does the Team plan support"
+    query_vector = (await intelligence.embed([query], task="query"))[0]
+
+    async with connection(tenant) as conn:
+        for plan, expected in (("team", True), ("Team", True), ("TEAM", True), ("business", False)):
+            outcome = await search_module.hybrid_search(
+                conn, query, query_vector, channel="internal", plan=plan
+            )
+            assert bool(outcome.passages) is expected, plan
+
+    # An unscoped query still sees a general document, and canonical matching
+    # uses the same normalised value.
+    async with connection(tenant) as conn:
+        outcome = await search_module.hybrid_search(conn, query, query_vector, channel="internal")
     assert outcome.passages

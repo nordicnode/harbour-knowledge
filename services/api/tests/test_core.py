@@ -10,7 +10,11 @@ from app.errors import AppError
 from app.intelligence.base import EvidencePassage, GenerationResult, RewriteResult
 from app.intelligence.dev import DevIntelligence, match_tokens
 from app.intelligence.openai_compat import OpenAICompatIntelligence
-from app.intelligence.local_embeddings import EmbeddingInputTooLong, LocalEmbeddingIntelligence
+from app.intelligence.local_embeddings import (
+    EmbeddingInputTooLong,
+    LocalEmbeddingIntelligence,
+    _batch_size_for_device,
+)
 from app.ingest.chunker import chunk_markdown, split_oversized_chunk
 from app.ingest.pipeline import normalise, quote_in_text, redact
 from app.ingest.parsers import UPLOAD_FORMATS, parse_bytes, upload_format
@@ -409,6 +413,40 @@ async def test_local_embedder_checks_exact_input_before_encoding() -> None:
     assert not model.encoded
 
 
+def test_cpu_and_gpu_use_different_embedding_batches() -> None:
+    settings = SimpleNamespace(local_embedding_batch_size=16, local_embedding_cpu_batch_size=1)
+    assert _batch_size_for_device("cpu", settings) == 1
+    assert _batch_size_for_device("cuda", settings) == 16
+    assert _batch_size_for_device(None, settings) == 16
+    settings.local_embedding_cpu_batch_size = 0
+    assert _batch_size_for_device("cpu", settings) == 1
+
+
+async def test_repeated_query_embeddings_are_cached() -> None:
+    settings = SimpleNamespace(
+        local_embedding_batch_size=16,
+        local_embedding_cpu_batch_size=1,
+        local_embedding_query_instruction="",
+        local_embedding_query_cache_size=2,
+        embedding_identity="test-identity",
+    )
+    provider = LocalEmbeddingIntelligence(settings)
+    provider._device = "cpu"
+    provider._model = object()
+    calls: list[list[str]] = []
+
+    def encode(_model, inputs):
+        calls.append(list(inputs))
+        return [[float(index)] for index in range(len(inputs))]
+
+    provider._encode = encode  # type: ignore[method-assign]
+    first = await provider.embed(["same question"], task="query")
+    second = await provider.embed(["same question"], task="query")
+    assert first == second and len(calls) == 1
+    await provider.embed(["different question"], task="query")
+    assert len(calls) == 2
+
+
 def test_chunk_preserves_literal_html_and_long_fenced_code() -> None:
     code = "```text\n<!-- page: 17 -->\n# Not a heading\n\n" + "value = 40\n" * 700 + "```"
     result = chunk_markdown("# Example\n\n" + code, max_section_tokens=5)
@@ -616,6 +654,33 @@ def test_unsupported_upload_extensions_rejected(filename) -> None:
         upload_format(filename)
 
 
+def test_separator_blocks_never_become_passages() -> None:
+    """A horizontal rule carries no fact and must not be indexed.
+
+    Separator-only passages got near-neutral embeddings, so they could outrank
+    real evidence in dense ranking while offering nothing to cite.
+    """
+    markdown = (
+        "# Reference\n\nIntro fact.\n\n---\n\n## Limits\n\nLimit is 40.\n\n"
+        "***\n\n___\n\nTrailing fact."
+    )
+    result = chunk_markdown(markdown, doc_type="policy")
+
+    texts = [chunk.text for chunk in result.chunks]
+    assert not any(set(text.strip()) <= {"-", "*", "_"} for text in texts)
+    assert not any(not any(character.isalnum() for character in text) for text in texts)
+    assert any("Intro fact." in text for text in texts)
+    assert any("Limit is 40." in text for text in texts)
+    assert any("Trailing fact." in text for text in texts)
+    assert not any("---" in section.text for section in result.sections)
+
+
+def test_fenced_separator_lines_are_still_preserved() -> None:
+    code = "```yaml\n---\nkey: 40\n---\n```"
+    result = chunk_markdown("# Example\n\n" + code)
+    assert any(chunk.text == code for chunk in result.chunks)
+
+
 async def test_unsupported_upload_rejected_at_http_boundary(monkeypatch) -> None:
     import httpx
     from app.deps import get_context
@@ -693,3 +758,219 @@ def test_embedding_identity_is_stable_and_config_sensitive() -> None:
         local_embedding_query_instruction="retrieve a",
         local_embedding_max_seq_length=256,
     ).embedding_identity
+
+
+def test_offline_generator_matches_inflections_but_not_missing_subjects() -> None:
+    """The offline provider must not abstain on a correct inflection.
+
+    "means" answers "mean" and "expenses" answers "expense"; a missing subject
+    ("city") still has to abstain, so no unsupported fact is invented.
+    """
+    import asyncio
+
+    from app.intelligence.dev import DevIntelligence, missing_gating_terms
+
+    provider = DevIntelligence()
+    sync = "Card sync\nE4021 means the card issuer connection failed. Reconnect the card and contact support if the error persists."
+    errors = asyncio.run(provider.generate_answer("What does error E4021 mean?", [
+        EvidencePassage(evidence_id="p1", text=sync, title="Sync"),
+    ]))
+    assert not errors.abstain and "E4021 means the card issuer connection failed." in errors.answer_md
+    assert missing_gating_terms("What does error E4021 mean?", sync) == set()
+
+    approvals = "In version 1, expenses under $50 are approved automatically. Expenses of $50 or more require manager approval."
+    plan = asyncio.run(provider.generate_answer("Which expenses need approval in version 1?", [
+        EvidencePassage(evidence_id="p1", text=approvals, title="Approvals"),
+    ]))
+    assert not plan.abstain
+
+    facts = "Mikey is 40 years old. Mikey was born on August 8th, 1986."
+    city = asyncio.run(provider.generate_answer("What city was Mikey born in?", [
+        EvidencePassage(evidence_id="p1", text=facts, title="Facts"),
+    ]))
+    assert city.abstain
+    assert missing_gating_terms("What city was Mikey born in?", facts) == {"city"}
+
+    # A different number is a different fact, never an inflection.
+    assert "128" in missing_gating_terms("Does the i5 9400 support 128 GB?", "It supports 64 GB.")
+
+
+def test_claim_support_handles_markup_but_refuses_dropped_conditions() -> None:
+    from app.retrieval.search import claim_supported_by_sentence, lexical_faithfulness
+
+    row = "| **TDP** | 65 W |"
+    assert claim_supported_by_sentence("TDP: 65 W", row)
+    assert claim_supported_by_sentence("| **TDP** | 65 W |", row)
+    # A value with its unit is a real span; a bare digit is not, because the
+    # same digit appears in many rows of one table.
+    assert claim_supported_by_sentence("65 W", row)
+    assert not claim_supported_by_sentence("65", row)
+    # Dropping a condition or adding a clause is not support.
+    assert not claim_supported_by_sentence(
+        "Refunds are available.",
+        "Refunds are available only to Enterprise customers.",
+    )
+    assert not claim_supported_by_sentence(
+        "Refunds are available.",
+        "Refunds are available within 30 days only to Enterprise customers.",
+    )
+    passage = SimpleNamespace(child_text="Refunds are available within 30 days of purchase.", parent_text="")
+    # The same claim without its trailing period is still the source's words.
+    assert lexical_faithfulness("Refunds are available within 30 days of purchase", [passage]) == 1.0
+    # Dropping the qualifier, or changing the number, is not.
+    assert lexical_faithfulness("Refunds are available within 30 days.", [passage]) == 0.0
+    assert lexical_faithfulness("Refunds are available within 14 days of purchase.", [passage]) == 0.0
+
+
+def _row_passage(text: str, title: str = "Intel Core i5-9400 specifications") -> SimpleNamespace:
+    return SimpleNamespace(
+        passage_id=uuid4(), parent_id=None, child_text=text, parent_text=text,
+        section_path="Specs", page_ref=None, document_id=uuid4(), document_title=title,
+        document_version=1, doc_type="product_description", effective_from=None,
+        plan_scope=[], version_scope=[], source_id=uuid4(), source_title=title,
+        source_tier="official_doc", visibility="internal", rerank_score=0.8, coverage=1.0,
+    )
+
+
+def test_table_row_fact_extracts_verbatim_rows_and_refuses_ambiguity() -> None:
+    from app.retrieval.answer import _table_row_fact
+
+    table = (
+        "| Attribute | Specification |\n| :--- | :--- |\n"
+        "| **Product Name** | Intel Core i5-9400 |\n"
+        "| **Cores / Threads** | 6 / 6 (No Hyper-Threading) |\n"
+        "| **Smart Cache (L3)** | 9 MB |"
+    )
+    passage = _row_passage(table)
+
+    cores = _table_row_fact("How many cores does the i5 9400 have?", [passage])
+    assert cores is not None
+    assert cores.answer_md == "| **Cores / Threads** | 6 / 6 (No Hyper-Threading) |"
+    assert cores.cited_ids == [str(passage.passage_id)]
+    assert lexical_faithfulness(cores.answer_md, [passage]) == 1.0
+
+    cache = _table_row_fact("What is the cache size of the i5 9400?", [passage])
+    assert cache is not None and "9 MB" in cache.answer_md
+
+    # An identifier in the question is a constraint the row must satisfy: an L3
+    # row cannot answer a question about L4.
+    assert _table_row_fact("What is the L4 cache size of the i5 9400?", [passage]) is None
+    # No named product, a different product, or a document about something else.
+    assert _table_row_fact("How many cores does it have?", [passage]) is None
+    assert _table_row_fact("How many cores does the i5 10400 have?", [passage]) is None
+    assert _table_row_fact("How many cores does the i5 9400 have?", [_row_passage(table, "Refund policy")]) is None
+
+    # Disagreeing rows are a human decision, not a guess.
+    other = _row_passage(table.replace("6 / 6", "4 / 4"))
+    assert _table_row_fact("How many cores does the i5 9400 have?", [passage, other]) is None
+
+
+def test_model_citations_accept_marker_forms_and_reject_unknown_labels() -> None:
+    import asyncio
+
+    from app.intelligence.openai_compat import OpenAICompatIntelligence
+
+    provider = object.__new__(OpenAICompatIntelligence)
+    evidence = [EvidencePassage(evidence_id="real-id", text="64 W", title="Facts")]
+    for returned, answer in (
+        (["P:E1"], "| TDP | 64 W | [P:E1]"),
+        (["[P:E1]"], "| TDP | 64 W |"),
+        ([], "| TDP | 64 W | [P:E1]"),
+        (["E1", "E9"], "TDP is 64 W [P:E1]"),
+    ):
+        provider._chat_json = AsyncMock(return_value={"answer_md": answer, "cited_ids": returned, "abstain": False})
+        result = asyncio.run(provider.generate_answer("What is the TDP?", evidence))
+        # The marker form resolves to the supplied evidence; an unknown label is
+        # dropped and never becomes a citation.
+        assert result.cited_ids == ["real-id"]
+        if "[P:E1]" in answer:
+            assert "[P:real-id]" in result.answer_md
+            assert "[P:E1]" not in result.answer_md
+
+
+def test_standalone_questions_skip_the_rewrite_model_call() -> None:
+    import asyncio
+
+    from app.intelligence.openai_compat import OpenAICompatIntelligence
+
+    provider = object.__new__(OpenAICompatIntelligence)
+    provider.settings = SimpleNamespace(embedding_dim=1024, embedding_model="dev-hashed-v1")
+    provider._lexical = DevIntelligence()
+    provider._chat_json = AsyncMock(side_effect=AssertionError("model must not be called"))
+
+    standalone = asyncio.run(provider.rewrite("What is the refund window for annual plans?"))
+    assert standalone.standalone_question == "What is the refund window for annual plans?"
+    provider._chat_json.assert_not_awaited()
+    # A follow-up or any history still needs the model to resolve references.
+    assert provider._needs_model_rewrite("and the annual one?", None)
+    assert provider._needs_model_rewrite("How much is it?", None)
+    assert provider._needs_model_rewrite("What is the refund window?", [{"role": "user", "content": "Hi"}])
+
+
+def test_scope_values_are_compared_case_insensitively() -> None:
+    from app.retrieval.search import normalise_scope_value
+
+    assert normalise_scope_value(" Team ") == "team"
+    assert normalise_scope_value("V2") == "v2"
+    assert normalise_scope_value("") is None
+    assert normalise_scope_value(None) is None
+
+
+def test_retrieval_strength_ignores_zero_score_filler() -> None:
+    """A correctly filtered query must not be diluted by ineligible filler.
+
+    With ``plan=v2`` only one passage is eligible; averaging a fixed top three
+    divided a good match by three and pushed supported answers into abstention.
+    """
+    from app.retrieval.search import SearchOutcome, retrieval_strength
+
+    passage = SimpleNamespace(rerank_score=0.66)
+    filler = SimpleNamespace(rerank_score=0.0)
+    focused = SearchOutcome(passages=[passage, filler, filler], candidates_scanned=3, query_coverage=0.5)
+    assert retrieval_strength(focused) == pytest.approx(0.62 * 0.66 + 0.38 * 0.5)
+    assert retrieval_strength(SearchOutcome(passages=[], candidates_scanned=0, query_coverage=0.0)) == 0.0
+
+
+def test_dense_scan_uses_the_measured_threshold() -> None:
+    from app.retrieval.search import _dense_scan_for_count
+
+    assert _dense_scan_for_count(0, 5000) == "exact"
+    assert _dense_scan_for_count(5000, 5000) == "exact"
+    assert _dense_scan_for_count(5001, 5000) == "hnsw"
+    # Zero disables exact scan even when the eligible set is empty.
+    assert _dense_scan_for_count(0, 0) == "hnsw"
+    assert _dense_scan_for_count(1, 0) == "hnsw"
+
+
+def test_parent_selection_keeps_two_children_per_section() -> None:
+    from app.retrieval.search import _select_diverse
+
+    first = uuid4()
+    second = uuid4()
+    rows = [
+        (0.9, {"parent_id": first, "passage_id": uuid4()}),
+        (0.8, {"parent_id": first, "passage_id": uuid4()}),
+        (0.7, {"parent_id": second, "passage_id": uuid4()}),
+        (0.6, {"parent_id": first, "passage_id": uuid4()}),
+        (0.5, {"parent_id": second, "passage_id": uuid4()}),
+    ]
+
+    selected = _select_diverse(rows, 4, 2)
+    assert [row["parent_id"] for _, row in selected] == [first, first, second, second]
+
+    # The old one-child behavior is still available for a controlled comparison.
+    selected_one = _select_diverse(rows, 4, 1)
+    assert [row["parent_id"] for _, row in selected_one] == [first, second]
+
+
+def test_connection_error_names_local_endpoint_and_start_command() -> None:
+    from app.intelligence.openai_compat import _unreachable_message
+
+    local = _unreachable_message("http://127.0.0.1:11434/v1", RuntimeError("Connection error."))
+    assert "http://127.0.0.1:11434/v1" in local
+    assert "make local-chat" in local
+    assert "Connection error." in local
+
+    remote = _unreachable_message("https://api.example.com/v1", RuntimeError("Connection error."))
+    assert "OPENAI_BASE_URL" in remote
+    assert "make local-chat" not in remote

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+from collections import OrderedDict
 from typing import Sequence
 
 from ..config import Settings
@@ -19,6 +21,18 @@ class EmbeddingInputTooLong(AppError):
         super().__init__("ingest_failed", f"Embedding input exceeds the local model limit ({detail}).")
 
 
+def _batch_size_for_device(device: str | None, settings: Settings) -> int:
+    """Use CPU-sized batches without changing GPU throughput.
+
+    CPU batches pad every passage to the longest one in the batch, so a large
+    GPU batch can be slower on a CPU with variable-length chunks. Measured on
+    the reference i5-9400, batch 1 was about 20–25% faster than batch 8.
+    """
+    if device and device.startswith("cpu"):
+        return max(1, getattr(settings, "local_embedding_cpu_batch_size", 1))
+    return max(1, getattr(settings, "local_embedding_batch_size", 16))
+
+
 class LocalEmbeddingIntelligence:
     """Sentence-Transformers embeddings running on the local machine.
 
@@ -26,8 +40,10 @@ class LocalEmbeddingIntelligence:
     worker start quickly and a machine without the optional dependencies can
     still use dev or remote embeddings. The default Qwen3-Embedding-0.6B model
     uses roughly 1.2 GB at 1024 dimensions. On a 6 GB card that is also running
-    a chat model, set LOCAL_EMBEDDING_DEVICE=cpu; the 0.6B model embeds the demo
-    corpus in a few seconds and leaves the GPU to the chat model.
+    a chat model, set LOCAL_EMBEDDING_DEVICE=cpu; the 0.6B model is usable on a
+    6-core CPU at batch 1 and leaves the GPU to the chat model. CPU batching is
+    deliberately small because padding to the longest item in a batch often
+    costs more than the vectorization saves.
     """
 
     name = "local"
@@ -35,7 +51,9 @@ class LocalEmbeddingIntelligence:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._model = None
+        self._device: str | None = None
         self._lock = asyncio.Lock()
+        self._query_cache: OrderedDict[tuple[str, str], list[float]] = OrderedDict()
 
     def _load_model(self):
         try:
@@ -51,6 +69,12 @@ class LocalEmbeddingIntelligence:
         if device.startswith("cuda") and not torch.cuda.is_available():
             log.warning("CUDA is unavailable; local embeddings will use the CPU")
             device = "cpu"
+        self._device = "cpu" if device.startswith("cpu") else device
+
+        threads = max(0, getattr(self.settings, "local_embedding_threads", 0))
+        if threads:
+            torch.set_num_threads(min(threads, os.cpu_count() or threads))
+            log.info("local embedding threads limited to %s", torch.get_num_threads())
 
         dtype = torch.float16
         if device == "cpu" or self.settings.local_embedding_dtype == "float32":
@@ -79,10 +103,11 @@ class LocalEmbeddingIntelligence:
                 f"{self.settings.embedding_dim}. Choose a matching model or re-index the database."
             )
         log.info(
-            "local embedding model ready: %s on %s (%s dimensions)",
+            "local embedding model ready: %s on %s (%s dimensions, batch %s)",
             self.settings.local_embedding_model,
             device,
             dimension,
+            _batch_size_for_device(self._device, self.settings),
         )
         return model
 
@@ -121,12 +146,29 @@ class LocalEmbeddingIntelligence:
         self._check_lengths(model, inputs)
         vectors = model.encode(
             inputs,
-            batch_size=self.settings.local_embedding_batch_size,
+            batch_size=_batch_size_for_device(self._device, self.settings),
             normalize_embeddings=True,
             show_progress_bar=False,
             convert_to_numpy=True,
         )
         return [vector.tolist() for vector in vectors]
+
+    def _cache_get(self, key: tuple[str, str]) -> list[float] | None:
+        if getattr(self.settings, "local_embedding_query_cache_size", 0) <= 0:
+            return None
+        vector = self._query_cache.get(key)
+        if vector is not None:
+            self._query_cache.move_to_end(key)
+        return vector
+
+    def _cache_put(self, key: tuple[str, str], vector: list[float]) -> None:
+        limit = int(getattr(self.settings, "local_embedding_query_cache_size", 0))
+        if limit <= 0:
+            return
+        self._query_cache[key] = list(vector)
+        self._query_cache.move_to_end(key)
+        while len(self._query_cache) > limit:
+            self._query_cache.popitem(last=False)
 
     async def check_embedding_lengths(self, texts: Sequence[str]) -> None:
         async with self._lock:
@@ -138,15 +180,27 @@ class LocalEmbeddingIntelligence:
         inputs = list(texts)
         if not inputs:
             return []
+        cache_keys = None
+        if task == "query" and getattr(self.settings, "local_embedding_query_cache_size", 0) > 0:
+            identity = self.settings.embedding_identity
+            cache_keys = [(identity, text) for text in inputs]
+            cached = [self._cache_get(key) for key in cache_keys]
+            if all(vector is not None for vector in cached):
+                return [list(vector) for vector in cached]
+
         if task == "query" and self.settings.local_embedding_query_instruction:
             instruction = self.settings.local_embedding_query_instruction
             inputs = [f"Instruct: {instruction}\nQuery: {text}" for text in inputs]
 
         async with self._lock:
+            if cache_keys is not None:
+                cached = [self._cache_get(key) for key in cache_keys]
+                if all(vector is not None for vector in cached):
+                    return [list(vector) for vector in cached]
             if self._model is None:
                 self._model = await asyncio.to_thread(self._load_model)
             try:
-                return await asyncio.to_thread(self._encode, self._model, inputs)
+                vectors = await asyncio.to_thread(self._encode, self._model, inputs)
             except RuntimeError as exc:
                 if "out of memory" in str(exc).lower():
                     raise provider_unavailable(
@@ -154,3 +208,7 @@ class LocalEmbeddingIntelligence:
                         "LOCAL_EMBEDDING_BATCH_SIZE or set LOCAL_EMBEDDING_DEVICE=cpu."
                     ) from exc
                 raise
+            if cache_keys is not None:
+                for key, vector in zip(cache_keys, vectors):
+                    self._cache_put(key, vector)
+            return vectors

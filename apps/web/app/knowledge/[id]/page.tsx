@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { ArrowLeft, CheckCircle2, ChevronDown, Clock3, FileText, TriangleAlert } from "lucide-react";
 
 import { AnswerEditor } from "@/components/answer-editor";
+import { AnswerText } from "@/components/answer-text";
 import { Badge, Card, PageHeader } from "@/components/ui";
 import { ApiError, apiGet } from "@/lib/api";
 import { formatDate, relativeTime, scopeLabel } from "@/lib/format";
@@ -110,7 +111,9 @@ export default async function AnswerPage({ params }: { params: Promise<{ id: str
             {evidence.length ? (
               evidence.map((item) => (
                 <div key={item.id} className="border-b border-line/70 px-4 py-3.5 last:border-b-0">
-                  <p className="text-[12px] leading-relaxed text-ink-2">“{item.quote}”</p>
+                  <div className="border-l-2 border-line pl-3">
+                    <AnswerText text={item.quote} dense />
+                  </div>
                   <div className="mt-2 flex items-center gap-1.5">
                     {item.quote_verified ? (
                       <CheckCircle2 size={11} className="text-pine" />

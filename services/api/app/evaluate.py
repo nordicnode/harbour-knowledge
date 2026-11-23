@@ -151,6 +151,7 @@ async def _run_case(conn, session: Session, settings, case: dict, sources: dict[
             "expected_behavior": case["expected_behavior"], "expected_answer": case.get("expected_answer"),
             "expected_canonical": case.get("expected_canonical"), "expected_evidence": relevant,
             "actual_mode": result["mode"], "abstained": result["abstained"],
+            "dense_scan": result.get("dense_scan"),
             "abstention_reason": result.get("abstention_reason"), "answer": result.get("answer_md"),
             "canonical_match": (str(expected_id) == result.get("answer_id")) if expected_id else None,
             "relevant_first_rank": min(ranks) if ranks else None,
@@ -182,6 +183,10 @@ def _summarize(results: list[dict]) -> dict:
         "evidence_mrr": round(sum(1 / r["relevant_first_rank"] if r["relevant_first_rank"] else 0 for r in relevant) / len(relevant), 3) if relevant else None,
         "citation_quotes": len(quotes),
         "citation_quote_presence_rate": _ratio(sum(c["quote_exists_in_passage"] for c in quotes), len(quotes)),
+        "dense_scan_modes": {
+            mode: sum(1 for r in results if r.get("dense_scan") == mode)
+            for mode in ("exact", "hnsw", "none")
+        },
         "ask_wall_ms_p50": _percentile([r["elapsed_ms"] for r in results], 0.5),
         "ask_wall_ms_p95": _percentile([r["elapsed_ms"] for r in results], 0.95),
     }
@@ -235,6 +240,8 @@ async def evaluate(corpus: dict, split: str) -> dict:
                                 "model_rewrite": settings.model_rewrite, "model_answer": settings.model_answer,
                                 "model_rerank": settings.model_rerank or "lexical fallback",
                                 "local_embedding_device": settings.local_embedding_device if settings.embedding_provider == "local" else None,
+                                "dense_exact_max_chunks": settings.dense_exact_max_chunks,
+                                "max_children_per_parent": settings.max_children_per_parent,
                                 "internal_thresholds": [settings.internal_low_threshold, settings.internal_high_threshold],
                                 "public_thresholds": [settings.public_low_threshold, settings.public_high_threshold],
                             },

@@ -11,7 +11,7 @@ from psycopg import AsyncConnection
 from ..config import get_settings
 from ..db import fetch_one
 from ..intelligence import get_intelligence
-from ..intelligence.dev import match_tokens
+from ..intelligence.dev import match_terms, term_overlap
 
 RRF_K = 60
 DENSE_LIMIT = 60
@@ -20,8 +20,73 @@ CANDIDATE_LIMIT = 40
 RERANK_KEEP = 8
 
 
+def _dense_scan_for_count(eligible: int, threshold: int) -> str:
+    """Choose exact scan while it is cheap enough to guarantee recall.
+
+    The threshold is a count of eligible current chunks, not a table size. A
+    filtered query over a large table can still have a small eligible set, so
+    the decision is made after the visibility and scope filters. A threshold of
+    zero disables the exact path entirely.
+    """
+    if threshold <= 0:
+        return "hnsw"
+    return "exact" if eligible <= threshold else "hnsw"
+
+
+def _select_diverse(
+    scored: list[tuple[float, dict]],
+    limit: int,
+    max_children_per_parent: int,
+) -> list[tuple[float, dict]]:
+    """Keep ranked rows without letting one section fill the result list.
+
+    A section often contains a rule and its exception, or several independent
+    table rows. One child per parent could hide the second fact; two preserves
+    it while avoiding a flood of overlapping siblings.
+    """
+    kept: list[tuple[float, dict]] = []
+    counts: dict[object, int] = {}
+    per_parent = max(1, max_children_per_parent)
+    for score, row in scored:
+        parent_key = row["parent_id"] or row["passage_id"]
+        if counts.get(parent_key, 0) >= per_parent:
+            continue
+        counts[parent_key] = counts.get(parent_key, 0) + 1
+        kept.append((score, row))
+        if len(kept) >= limit:
+            break
+    return kept
+
+
+# Weight of the fused dense+lexical agreement when ordering candidates.
+#
+# Ordering used to be the reranker's score alone. With no cross-encoder
+# configured the reranker is lexical overlap, which returns near-identical
+# scores for every passage of a document that mentions the subject, and then
+# orders them arbitrarily. That discarded the strongest signal available: in a
+# measured case the correct passage ranked first by dense retrieval and first by
+# RRF while sharing no vocabulary with the question ("released" vs "Launched"),
+# and the lexical reranker pushed it out of the top four. Fusion can only reorder
+# candidates the two retrievers already agreed on, so it restores recall rather
+# than inventing relevance.
+FUSION_WEIGHT = 0.3
+
+
 def vector_literal(vector: Sequence[float]) -> str:
     return "[" + ",".join(f"{value:.7f}" for value in vector) + "]"
+
+
+def normalise_scope_value(value: str | None) -> str | None:
+    """Plan and version identifiers are matched case-insensitively.
+
+    Ingestion lowercases source scope, while a model rewriting a question may
+    return "Team" or "V1". Comparing the raw strings silently excluded the only
+    relevant documents, so every path normalises before filtering and reporting.
+    """
+    if value is None:
+        return None
+    cleaned = value.strip().lower().lstrip(":")
+    return cleaned or None
 
 
 @dataclass
@@ -64,6 +129,8 @@ class SearchOutcome:
     # when the dense index is unavailable for the active embedding identity,
     # or "exact" for literal-token lookup.
     dense_index: str = "hybrid"
+    # Which dense path actually ran: "exact" cosine scan, "hnsw", or "none".
+    dense_scan: str = "hnsw"
     index_warning: str | None = None
 
 
@@ -74,9 +141,10 @@ FILTER_SQL = """
   and s.status = 'active'
   and s.deleted_at is null
   and s.visibility = any(%(visibilities)s::text[])
-  and (%(plan)s::text is null or cardinality(d.plan_scope) = 0 or %(plan)s::text = any(d.plan_scope))
+  and (%(plan)s::text is null or cardinality(d.plan_scope) = 0
+       or lower(%(plan)s::text) = any(select lower(scope) from unnest(d.plan_scope) scope))
   and (%(version)s::text is null or cardinality(d.product_version_scope) = 0
-       or %(version)s::text = any(d.product_version_scope))
+       or lower(%(version)s::text) = any(select lower(scope) from unnest(d.product_version_scope) scope))
   and (d.effective_from is null or d.effective_from <= coalesce(%(as_of)s::date, current_date))
   and (d.effective_to is null or d.effective_to > coalesce(%(as_of)s::date, current_date))
   and (%(topic)s::text is null or t.slug = %(topic)s)
@@ -117,6 +185,42 @@ async def _dense_index_state(conn: AsyncConnection, identity: str) -> tuple[bool
     return bool(row and row["compatible"]), bool(row and row["any_embedded"])
 
 
+async def _dense_candidate_count(
+    conn: AsyncConnection,
+    joins: str,
+    filters: str,
+    params: dict,
+    threshold: int,
+) -> int:
+    """Count eligible dense candidates, stopping just above the threshold.
+
+    The count is deliberately bounded: once more than `threshold` rows match, the
+    exact scan would be too expensive and the precise number no longer matters.
+    This query does not compute distances, so its cost is a small fraction of the
+    exact scan it is deciding against.
+    """
+    count_params = {
+        key: params[key]
+        for key in ("visibilities", "plan", "version", "as_of", "topic", "identity")
+    }
+    row = await fetch_one(
+        conn,
+        f"""
+          select count(*) as eligible
+          from (
+            select 1
+            {joins}
+            where {filters}
+              and p.embedding is not null
+              and p.embedding_identity = %(identity)s
+            limit %(probe_limit)s
+          ) candidates
+        """,
+        {**count_params, "probe_limit": max(0, threshold) + 1},
+    )
+    return int(row["eligible"] or 0) if row else 0
+
+
 async def hybrid_search(
     conn: AsyncConnection,
     query: str,
@@ -131,6 +235,8 @@ async def hybrid_search(
     visibility_override: list[str] | None = None,
 ) -> SearchOutcome:
     visibilities = visibility_override or (["public"] if channel == "public" else ["internal", "public"])
+    plan = normalise_scope_value(plan)
+    product_version = normalise_scope_value(product_version)
     settings = get_settings()
     identity = settings.embedding_identity
     params = {
@@ -150,6 +256,7 @@ async def hybrid_search(
     joins = BASE_JOINS
 
     use_dense = bool(embedding) and not exact
+    dense_scan = "none"
     index_warning = None
     if use_dense:
         compatible, any_embedded = await _dense_index_state(conn, identity)
@@ -162,9 +269,39 @@ async def hybrid_search(
                 else "No passages have embeddings for the active configuration. "
                 "Search used keyword matching only until the index is built with `make reindex`."
             )
+        elif settings.dense_exact_max_chunks > 0:
+            eligible = await _dense_candidate_count(
+                conn, joins, filters, params, settings.dense_exact_max_chunks
+            )
+            dense_scan = _dense_scan_for_count(eligible, settings.dense_exact_max_chunks)
+        else:
+            dense_scan = "hnsw"
     dense_index = "exact" if exact else ("hybrid" if use_dense else "lexical_only")
 
-    dense_cte = "dense as (select null::uuid as id, null::bigint as rn where false)," if not use_dense else f"""
+    if not use_dense:
+        dense_cte = "dense as (select null::uuid as id, null::bigint as rn where false),"
+    elif dense_scan == "exact":
+        # MATERIALIZED prevents the planner from satisfying the distance order
+        # from the HNSW index. Above the threshold this branch is never built.
+        dense_cte = f"""
+        exact_candidates as materialized (
+          select p.id, p.embedding
+          {joins}
+          where {filters}
+            and p.embedding is not null
+            and p.embedding_identity = %(identity)s
+        ),
+        dense as (
+          select id, rn
+          from (
+            select id, row_number() over (order by embedding <=> %(emb)s::vector) as rn
+            from exact_candidates
+          ) ranked
+          where rn <= %(dense_limit)s
+        ),
+    """
+    else:
+        dense_cte = f"""
         dense as (
           select p.id, row_number() over (order by p.embedding <=> %(emb)s::vector) as rn
           {joins}
@@ -226,7 +363,7 @@ async def hybrid_search(
     if not rows:
         return SearchOutcome(
             passages=[], candidates_scanned=0, query_coverage=0.0,
-            dense_index=dense_index, index_warning=index_warning,
+            dense_index=dense_index, dense_scan=dense_scan, index_warning=index_warning,
         )
 
     intelligence = get_intelligence()
@@ -235,21 +372,30 @@ async def hybrid_search(
     ]
     scores = await intelligence.rerank(query, documents)
 
-    query_terms = set(match_tokens(query))
+    # Comparison terms are lightly stemmed so "expense"/"expenses" and
+    # "mean"/"means" are not treated as different subjects. Stored vectors keep
+    # the unstemmed tokens; only scoring uses this view.
+    query_terms = match_terms(query)
     scored: list[tuple[float, dict]] = []
+    top_rrf = max((float(row["rrf"]) for row in rows), default=0.0) or 1.0
     for row, score in zip(rows, scores):
-        text_terms = set(match_tokens(f"{row['document_title']} {row['section_path']} {row['child_text']}"))
-        coverage = len(query_terms & text_terms) / max(1, len(query_terms))
-        scored.append((score, row | {"coverage": coverage}))
+        text_terms = match_terms(f"{row['document_title']} {row['section_path']} {row['child_text']}")
+        coverage = len(term_overlap(query_terms, text_terms)) / max(1, len(query_terms))
+        # Fused score: the reranker stays dominant, and agreement between dense
+        # and lexical retrieval breaks the near-ties it cannot separate.
+        fused = (1.0 - FUSION_WEIGHT) * float(score) + FUSION_WEIGHT * (float(row["rrf"]) / top_rrf)
+        scored.append((fused, row | {
+            "coverage": coverage,
+            "terms": text_terms,
+            "rerank_raw": float(score),
+            "rrf_normalised": float(row["rrf"]) / top_rrf,
+        }))
     scored.sort(key=lambda item: item[0], reverse=True)
 
     kept: list[RetrievedPassage] = []
-    seen_parents: set[UUID] = set()
-    for score, row in scored:
-        parent_key = row["parent_id"] or row["passage_id"]
-        if parent_key in seen_parents:
-            continue
-        seen_parents.add(parent_key)
+    for score, row in _select_diverse(
+        scored, RERANK_KEEP, settings.max_children_per_parent
+    ):
         kept.append(
             RetrievedPassage(
                 passage_id=row["passage_id"],
@@ -274,21 +420,23 @@ async def hybrid_search(
                 rrf_score=float(row["rrf"]),
                 rerank_score=float(score),
                 coverage=float(row["coverage"]),
+                extra={
+                    "rerank_raw": row["rerank_raw"],
+                    "rrf_normalised": row["rrf_normalised"],
+                },
             )
         )
-        if len(kept) >= RERANK_KEEP:
-            break
-
     coverage_union: set[str] = set()
     for item in kept[:5]:
-        coverage_union |= set(match_tokens(f"{item.document_title} {item.section_path} {item.child_text}"))
-    query_coverage = len(query_terms & coverage_union) / max(1, len(query_terms))
+        coverage_union |= match_terms(f"{item.document_title} {item.section_path} {item.child_text}")
+    query_coverage = len(term_overlap(query_terms, coverage_union)) / max(1, len(query_terms))
 
     return SearchOutcome(
         passages=kept,
         candidates_scanned=len(rows),
         query_coverage=min(1.0, query_coverage),
         dense_index=dense_index,
+        dense_scan=dense_scan,
         index_warning=index_warning,
     )
 
@@ -298,11 +446,19 @@ def retrieval_strength(outcome: SearchOutcome) -> float:
 
     Reranker scores supply the ordering signal; coverage catches the case where
     one strong match hides that the question has parts with no evidence at all.
+
+    The average is taken over the strongest passages that actually scored above
+    noise. Averaging a fixed top three punished correctly filtered queries: with
+    ``plan=v2`` only one passage is eligible, so the two filler passages' zero
+    scores divided a good match by three and pushed a supported answer below the
+    abstention band. A passage the reranker scored at zero is not evidence of
+    support and must not be able to dilute a confident one.
     """
     if not outcome.passages:
         return 0.0
-    top = sorted((p.rerank_score for p in outcome.passages), reverse=True)[:3]
-    mean_top = sum(top) / len(top)
+    ordered = sorted((p.rerank_score for p in outcome.passages), reverse=True)
+    relevant = [score for score in ordered if score > 0.05][:3] or ordered[:1]
+    mean_top = sum(relevant) / len(relevant)
     return max(0.0, min(1.0, 0.62 * mean_top + 0.38 * outcome.query_coverage))
 
 
@@ -331,6 +487,24 @@ def _grounding_sentences(text: str) -> list[str]:
     text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
     text = re.sub(r"(?m)^\s*(?:[-*]\s+|\d+[.)]\s+)", "", text)
     return [part.strip() for part in re.split(r"(?<=[.!?])\s+|\n+", text) if part.strip()]
+
+
+def _grounding_pieces(text: str) -> list[str]:
+    """Sentences plus individual table rows and short values.
+
+    A cited sentence list does not contain "65 W" on its own, so a one-value
+    answer could never verify against it. Table rows are complete evidence units
+    and are kept intact.
+    """
+    pieces: list[str] = []
+    for block in (text or "").splitlines():
+        stripped = block.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("|") and stripped.endswith("|"):
+            pieces.append(stripped)
+    pieces.extend(_grounding_sentences(text))
+    return pieces
 
 
 def _grounding_normalize(text: str) -> str:
@@ -388,26 +562,91 @@ def has_detectable_contradiction(answer_md: str, context: Sequence[RetrievedPass
     return False
 
 
+def _markup_normalize(text: str) -> str:
+    """Compare text by its words, ignoring presentation.
+
+    A table cell is rendered in the stored passage as ``| **TDP** | 65 W |`` and
+    an answer may quote it as "TDP: 65 W". Removing table pipes, emphasis,
+    citation markers and URLs cannot invent a number, a condition or a word, so
+    it is safe to treat the two as the same evidence.
+    """
+    import re
+
+    text = re.sub(r"\[P:[^\]]+\]|\[[0-9]+\]", " ", text or "")
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"[*_`>#|]+", " ", text)
+    text = re.sub(r"[^0-9a-z%.+-]+", " ", text.casefold())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def claim_supported_by_sentence(claim: str, sentence: str) -> bool:
+    """Decide whether one claim is supported by one cited sentence.
+
+    Three standards are accepted:
+
+    * **Verbatim** - the claim equals the sentence after normalisation. This is
+      the strict path and proves the words were copied.
+    * **Near-extractive** - the claim keeps nearly every content word of the
+      sentence and introduces almost none of its own, with identical numbers,
+      units and negation polarity. This tolerates dropped trailing punctuation,
+      markdown wrappers, a reordering, or a repeated subject, which are the
+      common ways a small local model reformats a copied sentence.
+    * **Markup-only difference** - the claim's words appear as a contiguous span
+      once table pipes and emphasis are removed, and it carries at least two
+      content words. This is how a table cell quoted as "TDP: 65 W" is
+      recognised without trusting the model's own citation.
+
+    It intentionally rejects a claim that drops a condition ("only Enterprise",
+    "within 30 days") or adds a clause: those are the cases where quote presence
+    most often gets mistaken for support.
+    """
+    if _grounding_normalize(claim) == _grounding_normalize(sentence):
+        return True
+
+    claim_content, claim_numbers, claim_negative = _contradiction_signature(claim)
+    sentence_content, sentence_numbers, sentence_negative = _contradiction_signature(sentence)
+    if not claim_content or not sentence_content:
+        return False
+    if claim_numbers != sentence_numbers or claim_negative != sentence_negative:
+        return False
+
+    shared = term_overlap(claim_content, sentence_content)
+    claim_coverage = len(shared) / len(claim_content)
+    sentence_coverage = len(shared) / len(sentence_content)
+    if claim_coverage >= 0.95 and sentence_coverage >= 0.7:
+        return True
+
+    # A single word can appear by coincidence ("6" is in many table rows), so a
+    # markup-only match needs enough substance to be evidence of a real span.
+    claim_words = _markup_normalize(claim).split()
+    if len(claim_words) < 2:
+        return False
+    return f" {_markup_normalize(claim)} " in f" {_markup_normalize(sentence)} "
+
+
 def lexical_faithfulness(
     answer_md: str,
     cited: Sequence[RetrievedPassage],
     context: Sequence[RetrievedPassage] | None = None,
 ) -> float:
-    """Fraction of claims matching complete cited child sentences verbatim.
+    """Fraction of claims matched by a complete cited child sentence.
 
-    This conservative extractive check rejects paraphrases it cannot verify;
-    it is not a semantic entailment guarantee. Context is checked for a
-    narrow set of explicit contradictory claims before a match is accepted.
+    Matching is verbatim or near-extractive; see `claim_supported_by_sentence`.
+    This is not a semantic entailment guarantee, and it is reported as
+    faithfulness, never as a probability that the answer is correct. Context is
+    checked for a narrow set of explicit contradictory claims first.
     """
     claims = _grounding_sentences(answer_md)
     if not claims:
         return 0.0
-    cited_sentences = [sentence for passage in cited for sentence in _grounding_sentences(passage.child_text)]
+    cited_pieces = [piece for passage in cited for piece in _grounding_pieces(passage.child_text)]
     checked_context = context if context is not None else cited
     supported = 0
     for claim in claims:
         normalized = _grounding_normalize(claim)
-        if not normalized or not any(normalized == _grounding_normalize(sentence) for sentence in cited_sentences):
+        if not normalized or not any(
+            claim_supported_by_sentence(claim, piece) for piece in cited_pieces
+        ):
             continue
         if not has_detectable_contradiction(claim, checked_context):
             supported += 1

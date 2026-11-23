@@ -33,6 +33,47 @@ def _strip_fences(text: str) -> str:
     return text
 
 
+def _label_id(value: object) -> str:
+    """Normalise a citation the model wrote back to a bare request label.
+
+    Local models copy the inline marker form instead of the bare label, so
+    "E2", "P:E2" and "[P:E2]" all identify evidence label E2. Only labels
+    supplied in the current request are ever resolved.
+    """
+    text = str(value).strip().strip("[]").strip()
+    if text.upper().startswith("P:"):
+        text = text[2:]
+    return text.strip().strip("[]").strip()
+
+
+def _unreachable_message(
+    base_url: str,
+    exc: Exception,
+    *,
+    embeddings: bool = False,
+) -> str:
+    """Turn an OpenAI SDK connection error into an actionable message.
+
+    A stopped local model server is the most common failure on this hardware,
+    and the SDK only reports "Connection error." That tells the reader neither
+    which endpoint failed nor how to start it.
+    """
+    endpoint = (base_url or "the configured endpoint").rstrip("/")
+    detail = str(exc).strip() or exc.__class__.__name__
+    if embeddings:
+        lead = f"The embedding provider is not reachable at {endpoint}."
+    else:
+        lead = f"The AI model server is not reachable at {endpoint}."
+    if endpoint.startswith(("http://127.0.0.1", "http://localhost", "http://[::1]", "http://0.0.0.0")):
+        hint = (
+            "If you use the project-local model, start it with `make local-chat`, "
+            "wait for it to load, then retry."
+        )
+    else:
+        hint = "Check network access and OPENAI_BASE_URL."
+    return f"{lead} {hint} ({detail})"
+
+
 class OpenAICompatIntelligence:
     """One implementation against Chat Completions semantics.
 
@@ -76,7 +117,10 @@ class OpenAICompatIntelligence:
         except RateLimitError as exc:
             raise rate_limited(str(exc)) from exc
         except APIConnectionError as exc:
-            raise provider_unavailable(f"Could not reach the embedding provider: {exc}") from exc
+            log.warning("Embedding provider connection failed at %s: %s", self.settings.openai_base_url, exc)
+            raise provider_unavailable(
+                _unreachable_message(self.settings.openai_base_url, exc, embeddings=True)
+            ) from exc
         except APIStatusError as exc:
             raise provider_rejected(f"Embedding provider rejected the request ({exc.status_code}).") from exc
         vectors = [item.embedding for item in response.data]
@@ -149,7 +193,10 @@ class OpenAICompatIntelligence:
             except RateLimitError as exc:
                 raise rate_limited(str(exc)) from exc
             except APIConnectionError as exc:
-                raise provider_unavailable(f"Could not reach the AI provider: {exc}") from exc
+                log.warning("AI provider connection failed at %s: %s", self.settings.openai_base_url, exc)
+                raise provider_unavailable(
+                    _unreachable_message(self.settings.openai_base_url, exc)
+                ) from exc
             except (json.JSONDecodeError, APIStatusError, IndexError, TypeError) as exc:
                 last_error = exc
                 log.warning("structured completion failed (%s), retrying", exc)
@@ -170,12 +217,36 @@ class OpenAICompatIntelligence:
         except RateLimitError as exc:
             raise rate_limited(str(exc)) from exc
         except APIConnectionError as exc:
-            raise provider_unavailable(f"Could not reach the AI provider: {exc}") from exc
+            log.warning("AI provider connection failed at %s: %s", self.settings.openai_base_url, exc)
+            raise provider_unavailable(
+                _unreachable_message(self.settings.openai_base_url, exc)
+            ) from exc
         except APIStatusError as exc:
             raise provider_rejected(f"The provider rejected the request ({exc.status_code}).") from exc
 
     # -- query understanding ------------------------------------------------
+    # A rewrite is only needed to resolve a follow-up against history. When the
+    # question already stands alone, the deterministic extractor below finds the
+    # same explicit plan, version and error codes the model would be asked for,
+    # so a full chat round trip (seconds on a 6 GB GPU, more on CPU) buys nothing.
+    FOLLOW_UP_RE = re.compile(
+        r"^\s*(?:and|also|but|so|then|what about|how about|why|how come)\b|\b(?:it|its|they|them|their|this|that|those|these|he|she|his|her)\b",
+        re.I,
+    )
+
+    def _needs_model_rewrite(self, question: str, history: Sequence[dict] | None) -> bool:
+        if history:
+            return True
+        text = question.strip()
+        if len(text) < 4 or len(text) > 400:
+            return False if len(text) < 4 else True
+        # "Thanks!", "and refunds?" and pronoun-led fragments need history.
+        return bool(self.FOLLOW_UP_RE.search(text))
+
     async def rewrite(self, question: str, history: Sequence[dict] | None = None) -> RewriteResult:
+        if not self._needs_model_rewrite(question, history):
+            # Offline extraction is deterministic and needs no network call.
+            return await self._lexical.rewrite(question, history)
         history_text = ""
         if history:
             history_text = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in history[-6:])
@@ -376,14 +447,24 @@ class OpenAICompatIntelligence:
             + conflict_text,
             f"Question: {question}\n\nEvidence:\n{self._evidence_block(labelled_evidence)}",
         )
-        cited = [labels[cid] for cid in data.get("cited_ids", []) if cid in labels]
+        answer_text = str(data.get("answer_md", ""))
+        raw_cited = data.get("cited_ids") if isinstance(data.get("cited_ids"), list) else []
+        cited = [labels[cid] for cid in (_label_id(value) for value in raw_cited) if cid in labels]
+        if not cited:
+            # A small model often returns "P:E2", "[P:E2]" or repeats only the
+            # inline marker in the text. Recover the IDs it actually named from
+            # the answer, and never accept a label this request did not supply.
+            for cid in re.findall(r"\[P:([^\]]+)\]", answer_text):
+                if _label_id(cid) in labels and labels[_label_id(cid)] not in cited:
+                    cited.append(labels[_label_id(cid)])
         answer_md = re.sub(
             r"\[P:([^\]]+)\]",
-            lambda match: f"[P:{labels[match.group(1)]}]" if match.group(1) in labels else match.group(0),
-            str(data.get("answer_md", "")),
+            lambda match: f"[P:{labels[_label_id(match.group(1))]}]"
+            if _label_id(match.group(1)) in labels else match.group(0),
+            answer_text,
         )
         return GenerationResult(
             answer_md=answer_md,
             cited_ids=cited,
-            abstain=bool(data.get("abstain")) or not data.get("answer_md"),
+            abstain=bool(data.get("abstain")) or not answer_text,
         )

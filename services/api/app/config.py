@@ -13,7 +13,9 @@ ROOT = Path(__file__).resolve().parents[3]
 # Bump when passage construction, tokenization, or embedding inputs change in a
 # way that makes previously stored vectors unsafe to reuse. Revision 2 marks the
 # first vectors produced only after enforcing the embedder's exact token limit.
-EMBEDDING_PIPELINE_REVISION = 2
+# Revision 3 stops indexing separator-only blocks and uses one situating blurb
+# per section, so the embedded text of a passage has changed.
+EMBEDDING_PIPELINE_REVISION = 3
 
 
 class Settings(BaseSettings):
@@ -60,7 +62,18 @@ class Settings(BaseSettings):
     local_embedding_device: str = "cuda"
     local_embedding_dtype: Literal["float16", "float32"] = "float16"
     local_embedding_batch_size: int = 16
+    # CPU inference is not GPU-style batching. Variable-length passage batches
+    # are padded to the longest item, and on the reference i5-9400 a batch of
+    # one was about 20–25% faster than a batch of eight or sixteen. GPU
+    # inference keeps `LOCAL_EMBEDDING_BATCH_SIZE` because batching helps there.
+    local_embedding_cpu_batch_size: int = 1
+    # 0 leaves PyTorch's default. On a small CPU also running the API and a
+    # local chat model, 4 often beats 6 by leaving headroom; measure first.
+    local_embedding_threads: int = 0
     local_embedding_max_seq_length: int = 512
+    # Reuse query vectors for repeated questions. Documents are deliberately
+    # not cached: the corpus is larger and the index already stores them.
+    local_embedding_query_cache_size: int = 256
     local_embedding_query_instruction: str = (
         "Given a support question, retrieve passages that answer it"
     )
@@ -69,6 +82,18 @@ class Settings(BaseSettings):
     internal_high_threshold: float = 0.52
     public_low_threshold: float = 0.55
     public_high_threshold: float = 0.72
+
+    # Exact vector scan is 100% recall but linear in the number of eligible
+    # chunks. On the reference machine (i5-9400, 1024-d vectors) a warm exact
+    # scan took ~5 ms at 1k chunks, ~26 ms at 5k and ~58 ms at 10k. Five
+    # thousand keeps the scan near 30 ms while avoiding the filtered-HNSW recall
+    # loss that grows as the corpus and tenant count increase. Set to 0 to use
+    # HNSW for every query.
+    dense_exact_max_chunks: int = 5000
+    # A section can contain a rule and an exception, or several independent
+    # rows. Keeping two children per section preserves that evidence without
+    # letting overlapping siblings fill the candidate list.
+    max_children_per_parent: int = 2
 
     db_pool_min: int = 1
     db_pool_max: int = 10

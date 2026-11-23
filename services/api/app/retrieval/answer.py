@@ -16,7 +16,7 @@ from ..config import Settings
 from ..deps import Session
 from ..errors import AppError, validation
 from ..intelligence import EvidencePassage, GenerationResult, get_intelligence
-from ..intelligence.dev import match_tokens, tokenize
+from ..intelligence.dev import match_tokens, term_matches, tokenize
 from ..ingest.pipeline import quote_in_text
 from .search import (
     RetrievedPassage,
@@ -101,6 +101,22 @@ def _iso(value) -> str | None:
     return str(value)
 
 
+def _quote_spans(text: str) -> list[tuple[int, int]]:
+    """Sentence-like spans that never lose or reorder a character.
+
+    A period inside a URL or an abbreviation ends a span early, which left
+    citations starting mid-URL ("html)). Launched on January 7, 2019"). Ending a
+    span after a closing parenthesis that is followed by a new capitalised
+    sentence keeps the excerpt starting at a real word without altering it.
+    """
+    boundaries = [0]
+    for match in re.finditer(r"(?<=[.!?])\s+|\n+|(?<=\))\s+(?=[A-Z(\[])", text):
+        boundaries.append(match.end())
+    boundaries.append(len(text))
+    spans = [(start, end) for start, end in zip(boundaries, boundaries[1:])]
+    return [(start, end) for start, end in spans if text[start:end].strip()]
+
+
 def _supporting_quote(answer_md: str, passage_text: str, max_chars: int = 600) -> str | None:
     """Pick an exact passage excerpt with the strongest overlap with the answer.
 
@@ -116,15 +132,15 @@ def _supporting_quote(answer_md: str, passage_text: str, max_chars: int = 600) -
 
     answer_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", answer_text) if s.strip()]
     candidates: list[tuple[float, int, int]] = []
-    for match in re.finditer(r"[^.!?\n]+[.!?]?", passage_text):
-        candidate = match.group().strip()
+    for start, end in _quote_spans(passage_text):
+        candidate = passage_text[start:end].strip()
         if not candidate:
             continue
         terms = set(match_tokens(candidate))
         if not terms:
             continue
         overlap = len(answer_terms & terms) / max(1, len(answer_terms))
-        candidates.append((overlap, match.start(), match.end()))
+        candidates.append((overlap, start, end))
     if not candidates:
         return None
 
@@ -198,6 +214,99 @@ def _table_fact_fallback(question: str, passages: list[RetrievedPassage]) -> Gen
         return None
     passage, row, _ = next(match for match in matches if match[0].document_id == top_document)
     return GenerationResult(answer_md=row, cited_ids=[str(passage.passage_id)])
+
+
+ROW_STOPWORDS = frozenset("""a an the is are was were be been what which who how does do did
+    many much of for in on at to from with its it this that these those have has had
+    i we you they he she product model number specification specs value please tell
+    give show find need want get""".split())
+
+
+def _model_ids(text: str) -> set[str]:
+    """Normalised product identifiers such as "i5 9400" or "i7-12700F"."""
+    return {
+        re.sub(r"[^a-z0-9]", "", match.group().lower())
+        for match in re.finditer(r"\b[a-z]+\d+[\s-]*\d+[a-z]?\b", text, re.I)
+    }
+
+
+def _attribute_rows(text: str) -> list[tuple[str, str, str]]:
+    """Return (line, key, value) for every two-column table row."""
+    rows: list[tuple[str, str, str]] = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not (stripped.startswith("|") and stripped.endswith("|")):
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if len(cells) != 2:
+            continue
+        key = re.sub(r"[*`_]", "", cells[0]).strip()
+        value = re.sub(r"[*`_]", "", cells[1]).strip()
+        if not key or not value:
+            continue
+        if re.fullmatch(r"[:\-\s]+", key) or re.fullmatch(r"[:\-\s]+", value):
+            continue
+        rows.append((stripped, key, value))
+    return rows
+
+
+def _table_row_fact(question: str, passages: list[RetrievedPassage]) -> GenerationResult | None:
+    """Extract one exact attribute row for an identified product.
+
+    A deterministic rescue, not a second opinion. The question must name exactly
+    one model, the row must be a two-column attribute row whose key matches an
+    asked attribute, every matching row in the retrieved evidence must carry the
+    same value, and the match must include the top-ranked passage. The returned
+    text is copied from the passage, so it is verbatim by construction and needs
+    no model call. Rows that disagree are left to a person instead of guessed.
+    """
+    models = _model_ids(question)
+    if len(models) != 1 or not passages:
+        return None
+    model = next(iter(models))
+    tokens = match_tokens(question)
+    # Tokens that name the product's identifier are the subject, not the asked
+    # attribute. Any *other* identifier in the question ("L4", "E4021") is a
+    # constraint the evidence has to satisfy, so answering an L4 question from an
+    # L3 row is not allowed.
+    identifiers = {
+        token for token in tokens
+        if re.search(r"\d", token) and token not in model
+    }
+    words = {
+        token for token in tokens
+        if token not in ROW_STOPWORDS and not re.search(r"\d", token)
+    }
+    if not words:
+        return None
+
+    matches: list[tuple[RetrievedPassage, str, str]] = []
+    for passage in passages:
+        # The document has to be about the named product, not merely mention it.
+        if model not in _model_ids(passage.document_title):
+            continue
+        for line, key, value in _attribute_rows(passage.child_text):
+            key_terms = set(match_tokens(key))
+            if not key_terms:
+                continue
+            row_terms = key_terms | set(match_tokens(value))
+            if identifiers and not all(
+                any(term_matches(identifier, term) for term in row_terms) for identifier in identifiers
+            ):
+                continue
+            if not any(term_matches(word, term) for word in words for term in key_terms):
+                continue
+            matches.append((passage, line, value.casefold()))
+    if not matches:
+        return None
+
+    top_document = passages[0].document_id
+    if not any(passage.document_id == top_document for passage, _, _ in matches):
+        return None
+    if len({value for _, _, value in matches}) != 1:
+        return None
+    passage, line, _ = next(m for m in matches if m[0].document_id == top_document)
+    return GenerationResult(answer_md=line, cited_ids=[str(passage.passage_id)])
 
 
 async def _historical_accuracy(conn: AsyncConnection, answer_id: UUID | None) -> float:
@@ -559,6 +668,59 @@ async def _canonical_payload(
     return citations, evidence, stale
 
 
+async def _document_chunks(conn: AsyncConnection, passage: RetrievedPassage, limit: int = 120) -> list[RetrievedPassage]:
+    """Current child passages of one document, for exact attribute lookup.
+
+    Deliberately scoped to the top-ranked document: the question is about the
+    product that document is about, so reading the rest of it is cheaper than a
+    second model call. These passages are only used to find a verbatim row that
+    is already stated in the source; they never author an answer on their own.
+    """
+    if conn is None:
+        return []
+    rows = await (
+        await conn.execute(
+            """select p.id as passage_id, p.parent_id, p.text as child_text,
+                      coalesce(parent.text, p.text) as parent_text,
+                      p.section_path, p.page_ref,
+                      d.id as document_id, d.title as document_title, d.version as document_version,
+                      d.doc_type, d.effective_from, d.plan_scope, d.product_version_scope,
+                      s.id as source_id, s.title as source_title, s.source_tier, s.visibility
+               from passages p
+               join documents d on d.id = p.document_id
+               join sources s on s.id = d.source_id
+               left join passages parent on parent.id = p.parent_id
+               where p.document_id = %s and p.level = 'chunk' and p.status = 'current'
+                 and d.status = 'current' and s.status = 'active' and s.deleted_at is null
+               order by p.chunk_index
+               limit %s""",
+            (passage.document_id, limit),
+        )
+    ).fetchall()
+    return [
+        RetrievedPassage(
+            passage_id=row["passage_id"],
+            parent_id=row["parent_id"],
+            child_text=row["child_text"],
+            parent_text=row["parent_text"],
+            section_path=row["section_path"] or "Overview",
+            page_ref=row["page_ref"],
+            document_id=row["document_id"],
+            document_title=row["document_title"],
+            document_version=row["document_version"],
+            doc_type=row["doc_type"],
+            effective_from=row["effective_from"],
+            plan_scope=row["plan_scope"] or [],
+            version_scope=row["product_version_scope"] or [],
+            source_id=row["source_id"],
+            source_title=row["source_title"],
+            source_tier=row["source_tier"],
+            visibility=row["visibility"],
+        )
+        for row in rows
+    ]
+
+
 async def _upsert_gap(
     conn: AsyncConnection,
     session: Session,
@@ -885,6 +1047,7 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
                 "latency_ms": latency_ms,
                 "provider": intelligence.name,
                 "retrieval_mode": outcome.dense_index,
+                "dense_scan": outcome.dense_scan,
                 "index_warning": outcome.index_warning,
             }
 
@@ -931,9 +1094,40 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
         valid_ids = {e.evidence_id for e in evidence}
         cited = [cid for cid in generation.cited_ids if cid in valid_ids]
         cited_passages = [p for p in outcome.passages if str(p.passage_id) in cited]
+
+        def extract_known_fact() -> tuple[GenerationResult | None, list[RetrievedPassage]]:
+            """Deterministic, verbatim extraction of a stated attribute.
+
+            Used when the model produced no usable citation, or when its answer
+            did not verify. It never invents a value: the returned text is copied
+            from a passage, and ambiguous or disagreeing rows are refused.
+            """
+            by_id = {str(p.passage_id): p for p in candidates}
+            for extractor in (_table_fact_fallback, _table_row_fact):
+                found = extractor(standalone, candidates)
+                if not found:
+                    continue
+                found_passages = [by_id[pid] for pid in found.cited_ids if pid in by_id]
+                if found_passages:
+                    return found, found_passages
+            return None, []
+
+        # An attribute row often sits in a section the retriever ranked below the
+        # passages that merely mention the product. Widen the deterministic
+        # extraction to the whole top-ranked document before paying for another
+        # model call; the extractors still refuse an unnamed or ambiguous value.
+        candidates = list(outcome.passages[:6])
+        if outcome.passages:
+            candidates = await _document_chunks(conn, outcome.passages[0]) + candidates
+
         if not generation.abstain and generation.answer_md and not cited_passages:
             # A small model can produce a malformed citation even when the
-            # answer is present. Retry once; never infer or guess an ID.
+            # answer is present. Recover an exact stated fact if the evidence
+            # contains one; never infer or guess an ID.
+            rescued, rescued_passages = extract_known_fact()
+            if rescued:
+                generation, cited_passages = rescued, rescued_passages
+        if not generation.abstain and generation.answer_md and not cited_passages:
             generation = await intelligence.generate_answer(standalone, evidence, _conflict_notice(top_conflicts))
             cited = [cid for cid in generation.cited_ids if cid in valid_ids]
             cited_passages = [p for p in outcome.passages if str(p.passage_id) in cited]
@@ -948,6 +1142,12 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
             abstain_reason = "The answer could not be grounded in the retrieved evidence."
         else:
             faithfulness = lexical_faithfulness(generation.answer_md, cited_passages, outcome.passages[:6])
+            if faithfulness < 1.0:
+                # A copied attribute row is exact, so prefer it to paying for a
+                # second model call that may paraphrase again.
+                rescued, rescued_passages = extract_known_fact()
+                if rescued:
+                    generation, cited_passages, faithfulness = rescued, rescued_passages, 1.0
             if faithfulness < 1.0:
                 retry = await intelligence.generate_answer(standalone, evidence, _conflict_notice(top_conflicts))
                 retry_cited = [cid for cid in retry.cited_ids if cid in valid_ids]
@@ -992,8 +1192,17 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
                     if conflict_notice:
                         answer_md = f"> **Sources disagree.** {conflict_notice}\n\n{answer_md}"
                     citations = []
+                    asked_models = _model_ids(standalone)
                     for p in cited_passages:
                         quote = _supporting_quote(generation.answer_md, p.child_text)
+                        # A question that names a product does not accept another
+                        # product's row as evidence: quoting "i5-9400F ... 65 W" for
+                        # an i5-9400 TDP question reads as a fact about the asked
+                        # part, and only the shared unit makes it look right.
+                        if quote and asked_models:
+                            quote_models = _model_ids(quote)
+                            if quote_models and not (quote_models & asked_models):
+                                continue
                         excerpt = quote or p.child_text[:300].strip()
                         if not excerpt:
                             continue
@@ -1055,6 +1264,7 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
                         "latency_ms": latency_ms,
                         "provider": intelligence.name,
                         "retrieval_mode": outcome.dense_index,
+                        "dense_scan": outcome.dense_scan,
                         "index_warning": outcome.index_warning,
                     }
 
@@ -1097,6 +1307,7 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
         "latency_ms": latency_ms,
         "provider": intelligence.name,
         "retrieval_mode": outcome.dense_index,
+        "dense_scan": outcome.dense_scan,
         "index_warning": outcome.index_warning,
     }
 

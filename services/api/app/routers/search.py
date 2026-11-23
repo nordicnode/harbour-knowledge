@@ -69,5 +69,6 @@ async def search_endpoint(
         "coverage": round(outcome.query_coverage, 3),
         "exact": exact,
         "retrieval_mode": outcome.dense_index,
+        "dense_scan": outcome.dense_scan,
         "index_warning": outcome.index_warning,
     }

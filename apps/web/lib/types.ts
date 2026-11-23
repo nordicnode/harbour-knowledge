@@ -65,6 +65,7 @@ export interface AskResult {
   latency_ms: number;
   provider: string;
   retrieval_mode: "hybrid" | "lexical_only" | "exact";
+  dense_scan: "exact" | "hnsw" | "none";
   index_warning: string | null;
 }
 
@@ -294,5 +295,6 @@ export interface SearchResponse {
   coverage: number;
   exact: boolean;
   retrieval_mode: "hybrid" | "lexical_only" | "exact";
+  dense_scan: "exact" | "hnsw" | "none";
   index_warning: string | null;
 }

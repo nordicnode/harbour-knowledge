@@ -43,6 +43,96 @@ def tokenize(text: str, keep_stop: bool = False) -> list[str]:
     return [t for t in tokens if t not in STOPWORDS and len(t) > 1]
 
 
+# Words that describe the *kind* of answer wanted rather than its subject. A
+# question about "what error E4021 means" is answerable from a passage that says
+# "E4021 means ...", and "expenses that need approval" from one that says
+# "require manager approval"; requiring the exact verb would abstain on correct
+# evidence. Every remaining content word, and every number or identifier, still
+# has to appear.
+NON_GATING_TERMS = frozenset("""
+    need needs needed require requires required must mean means meant meaning
+    define defined definition describe describes description explain explains
+    happen happens happened use used uses using work works worked allow allows
+    allowed permit permits provide provides provided include includes included
+    contain contains contained say says said state states stated call called
+    available possible can able get gets got give gives given take takes taken
+    make makes made find finds found tell tells told show shows shown know knows
+    cost costs price prices charge charges fee fees pay paid support supports
+    supported require requires requiring
+""".split())
+
+
+def stem_token(token: str) -> str:
+    """Strip common English plural/verb suffixes so inflections compare equal.
+
+    Deliberately crude, and never used to build stored vectors: changing
+    `tokenize` output would invalidate every existing embedding. `term_matches`
+    and `term_overlap` add a prefix rule on top, so "expense"/"expenses" and
+    "mean"/"means" agree without inventing synonyms.
+    """
+    if token.isdigit() or len(token) <= 4:
+        return token
+    for suffix in ("ings", "ing", "edly", "ed"):
+        if token.endswith(suffix) and len(token) - len(suffix) >= 3:
+            return token[: -len(suffix)]
+    if token.endswith("es") and token[:-1].endswith(("s", "x", "z", "ch", "sh")):
+        return token[:-2]
+    if token.endswith("s") and not token.endswith(("ss", "us", "is")):
+        return token[:-1]
+    return token
+
+
+def term_matches(left: str, right: str) -> bool:
+    """True when two terms are inflections of one another, not synonyms.
+
+    A shared four-character prefix covers "expense"/"expenses",
+    "require"/"requires", "remove"/"removed" and "mean"/"means". Short
+    tokens, numbers and identifiers must match exactly, so "64" never matches
+    "128" and "E4021" never matches "E4020".
+    """
+    if left == right:
+        return True
+    if len(left) < 4 or len(right) < 4:
+        return False
+    return left.startswith(right) or right.startswith(left)
+
+
+def term_overlap(left: set[str], right: set[str]) -> set[str]:
+    """Terms from `left` that have an inflection match in `right`."""
+    shared = left & right
+    remaining = right - shared
+    for token in left - shared:
+        if any(term_matches(token, other) for other in remaining):
+            shared.add(token)
+    return shared
+
+
+def gating_terms(text: str) -> set[str]:
+    """Content terms a passage must contain before it can answer a question."""
+    return {
+        token for token in match_tokens(text) if token not in NON_GATING_TERMS
+    }
+
+
+def missing_gating_terms(question: str, evidence_text: str) -> set[str]:
+    """Terms in the question that the evidence cannot support.
+
+    Numbers, identifiers and modifiers (``only``, ``not``, ``before``) are short
+    or exact, so inflection matching cannot turn "64 GB" into "128 GB".
+    """
+    required = gating_terms(question)
+    available = set(match_tokens(evidence_text))
+    return {
+        token for token in required
+        if not any(term_matches(token, other) for other in available)
+    }
+
+
+def match_terms(text: str) -> set[str]:
+    """Comparison terms for scoring only, never for stored embeddings."""
+    return set(match_tokens(text))
+
+
 def match_tokens(text: str) -> list[str]:
     """Normalize trailing sentence punctuation for lexical matching only.
 
@@ -109,7 +199,7 @@ class DevIntelligence:
             doc_tokens = match_tokens(doc)
             d_tokens = set(doc_tokens)
             d_pairs = {f"{a} {b}" for a, b in zip(doc_tokens, doc_tokens[1:])}
-            overlap = len(q_tokens & d_tokens) / len(q_tokens)
+            overlap = len(term_overlap(q_tokens, d_tokens)) / len(q_tokens)
             phrase = 1.0 if q_pairs & d_pairs else 0.0
             d_vec = self._embed_one(doc)
             cosine = _clamp(sum(a * b for a, b in zip(q_vec, d_vec)))
@@ -257,7 +347,7 @@ class DevIntelligence:
 
     # -- generation ---------------------------------------------------------
     def _rank_sentences(self, question: str, evidence: Sequence[EvidencePassage]) -> list[tuple[int, int, str, str]]:
-        q_tokens = set(tokenize(question))
+        q_tokens = match_terms(question)
         ranked: list[tuple[float, int, int, str, str]] = []
         for e_index, passage in enumerate(evidence):
             clean = re.sub(r"<!--.*?-->", " ", passage.text)
@@ -265,8 +355,8 @@ class DevIntelligence:
             if not sentences and clean.strip():
                 sentences = [clean.strip()]
             for s_index, sentence in enumerate(sentences):
-                s_tokens = set(tokenize(sentence))
-                overlap = len(q_tokens & s_tokens) / max(1, len(q_tokens))
+                s_tokens = set(match_tokens(sentence))
+                overlap = len(term_overlap(q_tokens, s_tokens)) / max(1, len(q_tokens))
                 detail = 0.08 if re.search(r"\d", sentence) else 0.0
                 position = 0.05 if s_index < 3 else 0.0
                 score = overlap * 1.0 + detail + position - 0.15 * (e_index / max(1, len(evidence)))
@@ -312,9 +402,9 @@ class DevIntelligence:
 
         # The development generator is extractive, not semantic. Do not answer
         # a question with unrelated facts when its key terms are absent.
-        question_terms = set(match_tokens(question))
-        evidence_terms = set(match_tokens(" ".join(item.text for item in evidence)))
-        if not question_terms or not question_terms.issubset(evidence_terms):
+        if not match_tokens(question):
+            return GenerationResult(answer_md="", cited_ids=[], abstain=True)
+        if missing_gating_terms(question, " ".join(item.text for item in evidence)):
             return GenerationResult(answer_md="", cited_ids=[], abstain=True)
 
         ranked = self._rank_sentences(question, evidence)

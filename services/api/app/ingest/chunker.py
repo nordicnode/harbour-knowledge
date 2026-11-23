@@ -61,6 +61,17 @@ def _fence_transition(line: str, fence: str | None) -> str | None:
     return fence
 
 
+def _has_content(text: str) -> bool:
+    """A passage must carry at least one alphanumeric character.
+
+    Separator-only blocks (``---``, ``***``, an empty table rule) carry no fact
+    and must never be embedded: a one-token separator gets a near-neutral
+    vector, so it can outrank real evidence in cosine ranking while offering
+    nothing to cite or ground an answer in.
+    """
+    return any(character.isalnum() for character in text)
+
+
 def _split_blocks(text: str) -> list[tuple[list[str], str | None]]:
     """Paragraph-aware blocks that keep tables, lists, and steps intact."""
     blocks: list[tuple[list[str], str | None]] = []
@@ -74,7 +85,7 @@ def _split_blocks(text: str) -> list[tuple[list[str], str | None]]:
             cleaned.pop(0)
         while cleaned and not cleaned[-1].strip():
             cleaned.pop()
-        if cleaned:
+        if cleaned and _has_content("\n".join(cleaned)):
             blocks.append((cleaned, None))
         current = []
 
@@ -96,6 +107,11 @@ def _split_blocks(text: str) -> list[tuple[list[str], str | None]]:
                 continue
             if current and _is_step_block(current):
                 continue
+            flush()
+            continue
+        if RULE_RE.match(raw):
+            # A horizontal rule separates content; it is not content. Keeping it
+            # produced passages whose entire text was "---".
             flush()
             continue
         if current and _is_table_block(current) and not raw.strip().startswith("|"):
@@ -239,6 +255,10 @@ def chunk_markdown(
             path_stack = [(lvl, name) for lvl, name in path_stack if lvl < level]
             path_stack.append((level, title))
             current_path = " › ".join(name for _, name in path_stack)
+            continue
+        if RULE_RE.match(line):
+            # A horizontal rule separates sections; keeping it in a section body
+            # produced passages whose entire text was "---".
             continue
         current_lines.append(line)
     flush()

@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 PIPELINE_VERSION = "v1"
 # Bump when passage construction changes, so an explicit re-ingest rebuilds
 # stale indexes even when the normalized content hash remains unchanged.
-INDEXING_VERSION = "3"
+INDEXING_VERSION = "4"
 REVIEW_INTERVAL = {
     "pricing": 30,
     "policy": 30,
@@ -294,16 +294,29 @@ async def _insert_passages(
     for chunk in chunk_set.chunks:
         by_section.setdefault(chunk.section_index, []).append(chunk)
 
-    async def contextualise(chunk, text: str) -> str:
+    async def section_context(section) -> str:
+        """One situating blurb per section, not one model call per passage.
+
+        A blurb describes the document, section, plan and version a passage sits
+        in; passages in the same section share almost all of that. Asking the
+        model once per section keeps the contextual-retrieval benefit while
+        removing most of the ingestion cost on a single-GPU machine, where each
+        chat call is seconds of serialised work.
+        """
         return await intelligence.contextualise(
-            document["title"], chunk.section_path, text,
+            document["title"], section.section_path, section.text,
             document["plan_scope"], document["product_version_scope"],
         )
 
     chunk_index = 0
     local_embeddings = getattr(intelligence, "embeddings", intelligence)
     checker = getattr(local_embeddings, "check_embedding_lengths", None)
+    blurb_cache: dict[str, str] = {}
     for section_index, chunks in by_section.items():
+        section = chunk_set.sections[section_index]
+        if section.section_path not in blurb_cache:
+            blurb_cache[section.section_path] = await section_context(section)
+        section_blurb = blurb_cache[section.section_path]
         # Split over-limit source material before sending it to the chat model;
         # no extra embeddings or regenerated context are needed for rejected text.
         candidates = [(chunk, chunk.text, 0) for chunk in chunks]
@@ -319,7 +332,7 @@ async def _insert_passages(
                     candidates[exc.index:exc.index + 1] = [
                         (chunk, part, depth + 1) for part in split_oversized_chunk(text)
                     ]
-        pending = [(chunk, text, await contextualise(chunk, text), depth) for chunk, text, depth in candidates]
+        pending = [(chunk, text, section_blurb, depth) for chunk, text, depth in candidates]
         def embedding_inputs():
             return [f"{blurb}\n\n{text}" if blurb else text for _, text, blurb, _ in pending]
 
@@ -340,8 +353,9 @@ async def _insert_passages(
                 if depth >= 32:
                     raise AppError("ingest_failed", "A passage could not be split within the embedding limit.")
                 pieces = split_oversized_chunk(text)
-                replacement = [(chunk, part, await contextualise(chunk, part), depth + 1) for part in pieces]
-                pending[exc.index:exc.index + 1] = replacement
+                pending[exc.index:exc.index + 1] = [
+                    (chunk, part, section_blurb, depth + 1) for part in pieces
+                ]
         if checker is not None:
             vectors = await intelligence.embed(embedding_inputs(), task="document")
         if len(vectors) != len(pending) or any(

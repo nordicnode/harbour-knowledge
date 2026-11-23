@@ -18,6 +18,10 @@ import { ApiError, apiGet } from "@/lib/api";
 import { formatDate, relativeTime, titleCase } from "@/lib/format";
 import type { Meta, SourceDetail, SourcePassage } from "@/lib/types";
 
+function hasMarkdown(text: string): boolean {
+  return /(^|\n)\s*(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|>|```|\|)|\*\*[^*\n]+\*\*|\[[^\]\n]+\]\([^)\n]+\)/.test(text);
+}
+
 function PassageBlock({ passage }: { passage: SourcePassage }) {
   return (
     <div className="border-t border-line/70 px-4 py-3 first:border-t-0">
@@ -28,7 +32,11 @@ function PassageBlock({ passage }: { passage: SourcePassage }) {
         {passage.page_ref ? <span className="text-[10px] text-faint">{passage.page_ref}</span> : null}
         {passage.status !== "current" ? <Badge tone="rust">{passage.status}</Badge> : null}
       </div>
-      <p className="whitespace-pre-wrap text-[12px] leading-relaxed text-ink-2">{passage.text}</p>
+      {hasMarkdown(passage.text) ? (
+        <AnswerText text={passage.text} dense />
+      ) : (
+        <p className="whitespace-pre-wrap text-[12px] leading-relaxed text-ink-2">{passage.text}</p>
+      )}
     </div>
   );
 }
@@ -236,7 +244,7 @@ export default async function SourcePage({ params }: { params: Promise<{ id: str
         <summary className="flex cursor-pointer list-none items-center gap-2 px-1 py-1">
           <Layers size={15} className="text-muted" />
           <span className="display text-[19px] leading-tight text-ink">Searchable passages</span>
-          <span className="text-[11px] text-faint">{passages.length}</span>
+          <span className="text-[11px] text-faint">{chunkCount}</span>
           <ChevronDown
             size={15}
             className="ml-auto text-faint transition-transform group-open:rotate-180"

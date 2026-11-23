@@ -69,6 +69,10 @@ export function ReviewCard({
   const Icon = ICONS[item.kind] ?? Inbox;
   const payload = item.payload ?? {};
   const answer = item.answer;
+  const citations = item.suggested_evidence?.map((passage) => ({
+    evidence_id: passage.id,
+    source_title: passage.source_title,
+  }));
 
   function decide(decision: "approve" | "reject" | "defer", explicitResolution?: string) {
     if (busyRef.current) return;
@@ -292,7 +296,10 @@ export function ReviewCard({
               {payload.summary ?? "Harbour drafted this from your sources."}
             </p>
             <div className="mt-3 rounded-lg border border-line bg-surface-2 px-3.5 py-3">
-              <AnswerText text={answer?.answer_md ?? payload.answer_md ?? "No draft attached yet."} />
+              <AnswerText
+                text={answer?.answer_md ?? payload.answer_md ?? "No draft attached yet."}
+                citations={citations}
+              />
             </div>
             {item.suggested_evidence?.length ? (
               <details className="group mt-2.5">
@@ -320,7 +327,10 @@ export function ReviewCard({
               {payload.summary ?? "An edited version is waiting to go live."}
             </p>
             <div className="mt-3 rounded-lg border border-line bg-surface-2 px-3.5 py-3">
-              <AnswerText text={item.suggested_md ?? answer?.answer_md ?? "No answer text attached."} />
+              <AnswerText
+                text={item.suggested_md ?? answer?.answer_md ?? "No answer text attached."}
+                citations={citations}
+              />
             </div>
             {item.suggested_md && answer?.answer_md ? (
               <details className="group mt-2.5">
