@@ -75,6 +75,24 @@ def test_compound_detection_does_not_split_ordinary_conjunctions() -> None:
     ) == ["When was the i5 9400 released", "How many cores does it have"]
 
 
+def test_boolean_answer_requires_the_question_attribute_and_matching_polarity() -> None:
+    from app.retrieval.search import claim_supported_by_sentence, lexical_faithfulness
+
+    question = "Does the i5 9400 CPU support hyper-threading?"
+    ht_row = "| **Intel Hyper-Threading Technology** | No | Strictly 1 thread per physical core |"
+    summary_row = "| **Cores / Threads** | 6 / 6 (No Hyper-Threading) |"
+    other_no_row = "| **Intel TSX-NI** | No | Transactional Synchronization Extensions disabled |"
+
+    assert claim_supported_by_sentence("No", ht_row, question)
+    assert claim_supported_by_sentence("No.", ht_row, question)
+    assert claim_supported_by_sentence("No, it does not support hyper-threading", ht_row, question)
+    assert claim_supported_by_sentence("No, it does not support hyper-threading", summary_row, question)
+    assert not claim_supported_by_sentence("No", other_no_row, question)
+    assert not claim_supported_by_sentence("Yes", ht_row, question)
+    assert lexical_faithfulness("No", [_passage(ht_row)], question=question) == 1.0
+    assert lexical_faithfulness("No", [_passage(other_no_row)], question=question) == 0.0
+
+
 def test_short_values_are_supported_only_by_the_same_cited_row() -> None:
     from app.retrieval.search import claim_supported_by_sentence
 

@@ -26,6 +26,7 @@ from ..ingest.pipeline import quote_in_text
 from .search import (
     RetrievedPassage,
     SearchOutcome,
+    any_claim_supported,
     band_for,
     confidence_composite,
     has_detectable_contradiction,
@@ -1050,7 +1051,7 @@ def _citations_for_answer(
         if not quote:
             continue
         excerpt = quote
-        if not excerpt:
+        if not excerpt or not any_claim_supported(answer_md, excerpt, question):
             continue
         citations.append(
             Citation(
@@ -1218,7 +1219,9 @@ async def _ask_multi_part(
                 cited_passages = [by_id[cid] for cid in cited_ids]
         if not answer_md or not cited_passages:
             return None
-        faithfulness = lexical_faithfulness(answer_md, cited_passages, merged.passages)
+        faithfulness = lexical_faithfulness(
+            answer_md, cited_passages, merged.passages, parts[part_index]
+        )
         if faithfulness < 1.0:
             rescue = _table_rescue(parts[part_index], merged.passages)
             if rescue:
@@ -1227,7 +1230,9 @@ async def _ask_multi_part(
                     cid for cid in (rescue.cited_ids or []) if cid in by_id
                 ))
                 cited_passages = [by_id[cid] for cid in cited_ids]
-                faithfulness = lexical_faithfulness(answer_md, cited_passages, merged.passages)
+                faithfulness = lexical_faithfulness(
+                    answer_md, cited_passages, merged.passages, parts[part_index]
+                )
         if faithfulness < 1.0:
             return None
         citations = _citations_for_answer(answer_md, cited_passages, parts[part_index])
@@ -1305,6 +1310,9 @@ async def _ask_multi_part(
         band = "medium" if band == "high" else band
 
     global_citations: list[dict] = []
+    # Two parts can quote the same row for different facts. Keep one copy of
+    # that exact quote, but do not collapse different quotes from one passage.
+    global_seen: dict[tuple[str, str], int] = {}
     sections: list[str] = []
     for index, part in enumerate(parts):
         if index not in resolved:
@@ -1317,8 +1325,13 @@ async def _ask_multi_part(
         for citation in result["citations"]:
             if citation.passage_id in markers:
                 continue
-            global_citations.append(citation.as_dict())
-            markers[citation.passage_id] = len(global_citations)
+            key = (citation.passage_id, citation.quote)
+            number = global_seen.get(key)
+            if number is None:
+                global_citations.append(citation.as_dict())
+                number = len(global_citations)
+                global_seen[key] = number
+            markers[citation.passage_id] = number
         part_answer = re.sub(
             r"\[P:([^\]]+)\]",
             lambda match: f"[{markers[match.group(1)]}]"
@@ -1602,7 +1615,9 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
         if generation.abstain or not generation.answer_md or not cited_passages:
             abstain_reason = "The answer could not be grounded in the retrieved evidence."
         else:
-            faithfulness = lexical_faithfulness(generation.answer_md, cited_passages, outcome.passages[:6])
+            faithfulness = lexical_faithfulness(
+                generation.answer_md, cited_passages, outcome.passages[:6], standalone
+            )
             if faithfulness < 1.0:
                 # A copied attribute row is exact, so prefer it to paying for a
                 # second model call that may paraphrase again.
@@ -1613,7 +1628,9 @@ async def ask(conn: AsyncConnection, session: Session, settings: Settings, reque
                 retry = await intelligence.generate_answer(standalone, evidence, _conflict_notice(top_conflicts))
                 retry_cited = [cid for cid in retry.cited_ids if cid in valid_ids]
                 retry_passages = [p for p in outcome.passages if str(p.passage_id) in retry_cited]
-                retry_faithfulness = lexical_faithfulness(retry.answer_md, retry_passages, outcome.passages[:6])
+                retry_faithfulness = lexical_faithfulness(
+                    retry.answer_md, retry_passages, outcome.passages[:6], standalone
+                )
                 if not retry.abstain and retry.answer_md.strip() and retry_faithfulness == 1.0 and retry_passages:
                     generation, cited_passages, faithfulness = retry, retry_passages, retry_faithfulness
                 else:

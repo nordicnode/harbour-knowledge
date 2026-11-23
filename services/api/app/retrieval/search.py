@@ -11,7 +11,13 @@ from psycopg import AsyncConnection
 from ..config import get_settings
 from ..db import fetch_one
 from ..intelligence import get_intelligence
-from ..intelligence.dev import match_terms, term_overlap
+from ..intelligence.dev import (
+    NON_GATING_TERMS,
+    gating_terms,
+    match_terms,
+    term_matches,
+    term_overlap,
+)
 
 RRF_K = 60
 DENSE_LIMIT = 60
@@ -620,10 +626,69 @@ def _short_table_value_supported(claim: str, sentence: str) -> bool:
     )
 
 
-def claim_supported_by_sentence(claim: str, sentence: str) -> bool:
+_REFERENCE_WORDS = frozenset(
+    "it its they them their this that these those he she him his her there".split()
+)
+
+
+def _short_table_boolean_supported(claim: str, sentence: str, question: str) -> bool:
+    """Accept a yes/no answer when the cited row states the same polarity.
+
+    A model often answers a boolean attribute question with just "No" while
+    citing the row ``| Intel Hyper-Threading Technology | No | ... |``. The
+    generic sentence checks reject that because "No" has no content word to
+    match. Requiring the row to overlap the question's attribute, and the
+    claim's polarity to match the row's explicit yes/no value, keeps an
+    unrelated "No" row from supporting the answer.
+    """
+    import re
+
+    if not question:
+        return False
+    row = sentence.strip()
+    if not (row.startswith("|") and row.endswith("|")):
+        return False
+    claim_tokens = _markup_normalize(claim).split()
+    if not (0 < len(claim_tokens) <= 12):
+        return False
+    content, numbers, negative = _contradiction_signature(claim)
+    if numbers:
+        return False
+
+    question_terms = {
+        token for token in gating_terms(question)
+        if not any(character.isdigit() for character in token)
+    }
+    row_text = _markup_normalize(row)
+    row_terms = set(row_text.split())
+    # The row may keep "hyper-threading" as one token while the claim's
+    # signature splits it into two words. Compare the component words too.
+    row_terms.update(
+        part for token in list(row_terms) for part in re.split(r"[-/]", token) if part
+    )
+    if not question_terms or not any(
+        term_matches(term, row_term) for term in question_terms for row_term in row_terms
+    ):
+        return False
+    if negative and not re.search(r"\bno\b", row_text):
+        return False
+    if not negative and not re.search(r"\byes\b", row_text):
+        return False
+
+    # Every extra fact in the claim must also be present in the row. Question
+    # verbs such as "support" are not facts and are ignored here.
+    return all(
+        term in NON_GATING_TERMS
+        or term in _REFERENCE_WORDS
+        or any(term_matches(term, row_term) for row_term in row_terms)
+        for term in content
+    )
+
+
+def claim_supported_by_sentence(claim: str, sentence: str, question: str = "") -> bool:
     """Decide whether one claim is supported by one cited sentence.
 
-    Four standards are accepted:
+    Five standards are accepted:
 
     * **Verbatim** - the claim equals the sentence after normalisation. This is
       the strict path and proves the words were copied.
@@ -631,6 +696,10 @@ def claim_supported_by_sentence(claim: str, sentence: str) -> bool:
       table row, with every meaningful token and number present in that row.
       This covers "6 cores" and "Launched on January 7, 2019" without letting a
       bare digit match an unrelated row.
+    * **Boolean table value** - "Yes" or "No" matches an explicit yes/no cell
+      in a row whose attribute overlaps the question, so a one-word answer to
+      "Does it support hyper-threading?" is grounded without accepting a
+      different row that also says "No".
     * **Near-extractive** - the claim keeps nearly every content word of the
       sentence and introduces almost none of its own, with identical numbers,
       units and negation polarity. This tolerates dropped trailing punctuation,
@@ -648,6 +717,8 @@ def claim_supported_by_sentence(claim: str, sentence: str) -> bool:
     if _grounding_normalize(claim) == _grounding_normalize(sentence):
         return True
     if _short_table_value_supported(claim, sentence):
+        return True
+    if _short_table_boolean_supported(claim, sentence, question):
         return True
 
     claim_content, claim_numbers, claim_negative = _contradiction_signature(claim)
@@ -671,10 +742,19 @@ def claim_supported_by_sentence(claim: str, sentence: str) -> bool:
     return f" {_markup_normalize(claim)} " in f" {_markup_normalize(sentence)} "
 
 
+def any_claim_supported(answer_md: str, sentence: str, question: str = "") -> bool:
+    """True when at least one claim in the answer is supported by this excerpt."""
+    return any(
+        claim_supported_by_sentence(claim, sentence, question)
+        for claim in _grounding_sentences(answer_md)
+    )
+
+
 def lexical_faithfulness(
     answer_md: str,
     cited: Sequence[RetrievedPassage],
     context: Sequence[RetrievedPassage] | None = None,
+    question: str = "",
 ) -> float:
     """Fraction of claims matched by a complete cited child sentence.
 
@@ -692,7 +772,7 @@ def lexical_faithfulness(
     for claim in claims:
         normalized = _grounding_normalize(claim)
         if not normalized or not any(
-            claim_supported_by_sentence(claim, piece) for piece in cited_pieces
+            claim_supported_by_sentence(claim, piece, question) for piece in cited_pieces
         ):
             continue
         if not has_detectable_contradiction(claim, checked_context):
